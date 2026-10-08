@@ -26,7 +26,7 @@ from typing import Any
 from novel import config
 from novel.formats import DEFAULT_FORMAT
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
 
 #: Таблицы по отдельности: миграции пересоздают их по одной, а не весь файл.
 TABLES: dict[str, str] = {
@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS worlds (
     narrator TEXT NOT NULL DEFAULT '',
     hidden_rules TEXT NOT NULL DEFAULT '',
     image_suffix TEXT NOT NULL DEFAULT '',
+    image_policy TEXT NOT NULL DEFAULT '',
+    image_frame TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 )""",
@@ -70,6 +72,7 @@ CREATE TABLE IF NOT EXISTS characters (
     description TEXT NOT NULL DEFAULT '',
     appearance TEXT NOT NULL DEFAULT '',
     speech TEXT NOT NULL DEFAULT '',
+    voice TEXT NOT NULL DEFAULT '',
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL
 )""",
@@ -78,6 +81,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY,
     world_id INTEGER NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
     title TEXT NOT NULL DEFAULT '',
+    format TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 )""",
@@ -184,9 +188,10 @@ CREATE INDEX IF NOT EXISTS idx_rules_world ON world_rules(world_id, priority);
 SHAPE_REQUIREMENTS: dict[str, tuple[set[str], list[str]]] = {
     # Дополнение к промпту кадров появилось позже остальных полей мира.
     "worlds": (
-        {"image_suffix"},
+        {"image_suffix", "image_policy", "image_frame"},
         ["id", "name", "format", "brief", "genre", "tone", "style", "narrator",
-         "hidden_rules", "image_suffix", "created_at", "updated_at"],
+         "hidden_rules", "image_suffix", "image_policy", "image_frame",
+         "created_at", "updated_at"],
     ),
     "scenes": (
         {"session_id", "message_id", "raw_description", "elapsed_s"},
@@ -225,6 +230,12 @@ CARRY_EXPRESSIONS: dict[str, dict[str, str]] = {
 #: нужно пересоздавать: ``ALTER TABLE ADD COLUMN`` дописывает их на месте.
 EXTRA_COLUMNS: dict[str, dict[str, str]] = {
     "messages": {"attachments": "TEXT NOT NULL DEFAULT ''"},
+    "characters": {"voice": "TEXT NOT NULL DEFAULT ''"},
+    "sessions": {"format": "TEXT NOT NULL DEFAULT ''"},
+    "worlds": {
+        "image_policy": "TEXT NOT NULL DEFAULT ''",
+        "image_frame": "TEXT NOT NULL DEFAULT ''",
+    },
     "scenes": {
         "location_id": "INTEGER",
         "used_reference": "INTEGER NOT NULL DEFAULT 0",
@@ -256,16 +267,20 @@ class World:
     #: Дополнение, которое приписывается к каждому промпту кадра дословно.
     #: Ведущий его не видит и переписать не может: постоянная часть промпта.
     image_suffix: str
-    created_at: int
-    updated_at: int
+    #: Когда рисовать кадры в этом мире. Пустая строка означает «как в настройках».
+    image_policy: str = ""
+    #: Что показывать в кадре. Пустая строка означает «как в настройках».
+    image_frame: str = ""
+    created_at: int = 0
+    updated_at: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         """Поля мира для интерфейса.
 
         Одно место на все ответы: словарь, собранный руками, отстаёт от таблицы
         при каждом новом поле, и добавленное поле просто не доезжает до
-        страницы. Так пропало «дополнение к каждому кадру» — оно сохранялось в
-        базу, но не возвращалось, и поле стиралось при каждом обновлении.
+        страницы. Поле, которое сохраняется в базу, но не возвращается отсюда,
+        стирается при каждом обновлении.
 
         @returns: словарь полей мира.
         """
@@ -273,6 +288,8 @@ class World:
             "id": self.id,
             "name": self.name,
             "format": self.format,
+            "image_policy": self.image_policy,
+            "image_frame": self.image_frame,
             "brief": self.brief,
             "genre": self.genre,
             "tone": self.tone,
@@ -312,6 +329,10 @@ class Character:
     speech: str
     enabled: int
     created_at: int
+    #: Образцы настоящих сообщений этого человека: по ним ведущий подстраивается
+    #: под манеру, когда игрок принёс переписку из жизни. Поле стоит последним
+    #: и со значением по умолчанию: карточки собираются и без него.
+    voice: str = ""
 
 
 @dataclass
@@ -323,6 +344,9 @@ class Session:
     title: str
     created_at: int
     updated_at: int
+    #: Формат диалога этой партии. Пустая строка означает «как у мира»: так
+    #: ведут себя партии, заведённые до того, как формат переехал в партию.
+    format: str = ""
 
 
 @dataclass
@@ -460,9 +484,9 @@ class NovelDB:
     Соединение заводится **на каждый поток**. Одно общее соединение с
     ``check_same_thread=False`` выглядит рабочим, но под параллельными запросами
     разваливается: интерфейс опрашивает ``/api/status`` из разных потоков, и
-    однажды запрос вернул пустую строку вместо счётчика — ``TypeError:
+    запрос может вернуть пустую строку вместо счётчика — ``TypeError:
     'NoneType' object is not subscriptable`` в ``stats()``, из-за которого
-    переставал отвечать весь ``/api/status``.
+    перестаёт отвечать весь ``/api/status``.
 
     У каждого потока своё соединение, а запись разводится таймаутом ожидания:
     в режиме WAL читатели писателю не мешают, а два писателя иначе получили бы
@@ -776,14 +800,22 @@ class NovelDB:
         narrator: str = "",
         hidden_rules: str = "",
         image_suffix: str = "",
+        image_policy: str = "",
+        image_frame: str = "",
     ) -> int:
-        """Создаёт мир и возвращает его идентификатор."""
+        """Создаёт мир и возвращает его идентификатор.
+
+        @param image_policy: когда рисовать кадры; пустая строка — как в настройках.
+        @param image_frame: что показывать в кадре; пустая строка — как в настройках.
+        @returns: идентификатор мира.
+        """
         now = int(time.time())
         cursor = self.conn.execute(
             "INSERT INTO worlds (name, format, brief, genre, tone, style, narrator, hidden_rules,"
-            " image_suffix, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " image_suffix, image_policy, image_frame, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (name, format, brief, genre, tone, style, narrator, hidden_rules, image_suffix,
-             now, now),
+             image_policy, image_frame, now, now),
         )
         self.conn.commit()
         return int(cursor.lastrowid)
@@ -805,7 +837,7 @@ class NovelDB:
         @returns: имена отклонённых полей.
         """
         allowed = {"name", "format", "brief", "genre", "tone", "style", "narrator",
-                   "hidden_rules", "image_suffix"}
+                   "hidden_rules", "image_suffix", "image_policy", "image_frame"}
         rejected = [key for key in changes if key not in allowed]
         fields = {key: value for key, value in changes.items() if key in allowed}
         if fields:
@@ -881,16 +913,21 @@ class NovelDB:
         description: str = "",
         appearance: str = "",
         speech: str = "",
+        voice: str = "",
         enabled: bool = True,
     ) -> int:
-        """Добавляет персонажа."""
+        """Добавляет персонажа.
+
+        @param voice: образцы настоящих сообщений человека, по строке на образец.
+        @returns: идентификатор персонажа.
+        """
         # Имя обрезается по краям: «Хозяйка » и «Хозяйка» — для словаря внешности
         # два разных человека, и ведущий начинает их путать.
         cursor = self.conn.execute(
             "INSERT INTO characters (world_id, name, role, description, appearance, speech,"
-            " enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " voice, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (world_id, name.strip(), role, description, appearance, speech,
-             int(enabled), int(time.time())),
+             voice, int(enabled), int(time.time())),
         )
         self.conn.commit()
         return int(cursor.lastrowid)
@@ -913,7 +950,7 @@ class NovelDB:
 
     def update_character(self, character_id: int, changes: dict[str, Any]) -> list[str]:
         """Правит карточку персонажа."""
-        allowed = {"name", "role", "description", "appearance", "speech", "enabled"}
+        allowed = {"name", "role", "description", "appearance", "speech", "voice", "enabled"}
         rejected = [key for key in changes if key not in allowed]
         fields = {key: value for key, value in changes.items() if key in allowed}
         if "name" in fields:
@@ -936,12 +973,19 @@ class NovelDB:
 
     # --- партии -------------------------------------------------------------
 
-    def create_session(self, world_id: int, title: str = "") -> int:
-        """Создаёт партию в мире."""
+    def create_session(self, world_id: int, title: str = "", format: str = "") -> int:
+        """Создаёт партию в мире.
+
+        @param world_id: мир.
+        @param title: название партии.
+        @param format: формат диалога; пустая строка означает «как у мира».
+        @returns: идентификатор партии.
+        """
         now = int(time.time())
         cursor = self.conn.execute(
-            "INSERT INTO sessions (world_id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            (world_id, title, now, now),
+            "INSERT INTO sessions (world_id, title, format, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (world_id, title, format, now, now),
         )
         self.conn.commit()
         return int(cursor.lastrowid)
@@ -975,9 +1019,25 @@ class NovelDB:
 
     def rename_session(self, session_id: int, title: str) -> None:
         """Переименовывает партию."""
+        """Переименовывает партию."""
         self.conn.execute(
             "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?",
             (title.strip() or "Без названия", int(time.time()), session_id),
+        )
+        self.conn.commit()
+
+    def set_session_format(self, session_id: int, fmt: str) -> None:
+        """Задаёт формат диалога у партии.
+
+        Пустая строка означает «как у мира»: тогда формат берётся у мира, как
+        было до того, как он переехал в партию.
+
+        @param session_id: партия.
+        @param fmt: ключ формата или пустая строка.
+        """
+        self.conn.execute(
+            "UPDATE sessions SET format = ?, updated_at = ? WHERE id = ?",
+            (fmt.strip(), int(time.time()), session_id),
         )
         self.conn.commit()
 

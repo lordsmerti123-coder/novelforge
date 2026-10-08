@@ -37,11 +37,70 @@ def already_running() -> bool:
     @returns: ``True``, если интерфейс уже поднят.
     """
     try:
-        with urllib.request.urlopen(f"{URL}api/status", timeout=3) as response:
+        with urllib.request.urlopen(f"{URL}api/status", timeout=12) as response:
             json.loads(response.read().decode("utf-8"))
         return True
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         return False
+
+
+def port_busy() -> bool:
+    """Занят ли порт, даже если приложение не отвечает.
+
+    Ответа на ``/api/status`` для этого мало: экземпляр может быть занят
+    загрузкой модели и не ответить за отведённые секунды, оставаясь при этом
+    хозяином порта. Подключение показывает занятость независимо от ответа.
+
+    @returns: ``True``, если порт кем-то занят.
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(2.0)
+        return probe.connect_ex(("127.0.0.1", PORT)) == 0
+
+
+def ask_take_over() -> bool:
+    """Спрашивает, закрывать ли прежний экземпляр.
+
+    @returns: ``True``, если пользователь согласен на замену.
+    """
+    try:
+        answer = ctypes.windll.user32.MessageBoxW(
+            None,
+            f"{TITLE} уже запущен, но не отвечает.\n\n"
+            f"Закрыть прежний экземпляр и запустить заново?\n\n"
+            f"Если ответить «Нет», откроется окно уже работающего приложения.",
+            TITLE, 0x04 | 0x30,  # да/нет, значок вопроса
+        )
+        return answer == 6  # IDYES
+    except (AttributeError, OSError):
+        return False
+
+
+def close_previous(log) -> int:
+    """Закрывает прежние экземпляры приложения.
+
+    Гасятся только процессы этого самого запускателя: чужие трогать не за что.
+
+    @param log: открытый журнал.
+    @returns: сколько процессов закрыто.
+    """
+    import subprocess
+
+    script = (
+        "Get-CimInstance Win32_Process -Filter \"name='pythonw.exe' OR name='python.exe'\" | "
+        "Where-Object { $_.CommandLine -like '*novelforge*launcher.py*' } | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+    )
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                       capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.write(f"закрыть прежние экземпляры не удалось: {exc}\n")
+        return 0
+    time.sleep(2)
+    return 1
 
 
 def show_message(text: str, title: str = TITLE) -> None:
@@ -68,6 +127,30 @@ def main() -> int:
         log.write("интерфейс уже запущен, открываю браузер\n")
         webbrowser.open(URL)
         return 0
+
+    if port_busy():
+        # Порт занят, а приложение не отвечает: скорее всего, остался прежний
+        # экземпляр. Молча занимать порт нельзя — отказ уйдёт в журнал, и
+        # снаружи это выглядит как «ничего не произошло».
+        log.write("порт занят, приложение не отвечает — спрашиваю пользователя\n")
+        if ask_take_over():
+            close_previous(log)
+            for _ in range(20):
+                if not port_busy():
+                    break
+                time.sleep(1)
+        else:
+            log.write("пользователь отказался, открываю браузер\n")
+            webbrowser.open(URL)
+            return 0
+        if port_busy():
+            log.write("порт всё ещё занят\n")
+            show_message(
+                f"Порт {PORT} занят другим процессом.\n\n"
+                f"Закройте его или перезагрузите компьютер.\n"
+                f"Подробности: {LOG_PATH}"
+            )
+            return 1
 
     try:
         sys.path.insert(0, str(PROJECT))

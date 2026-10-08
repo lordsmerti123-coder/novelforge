@@ -1,32 +1,19 @@
-"""Форматы диалога.
+"""Типы повествования: история, чат и квест.
 
-Формат определяет три вещи сразу: что именно модель пишет в ответе, как этот
-ответ рисуется в интерфейсе и какую роль играет картинка. Поэтому формат — не
-косметическая настройка, а часть протокола.
-
-Общее для всех форматов: игроку показывается только содержимое ``<prose>``, а
-служебные блоки ``<scene>`` и ``<speculative>`` уходят оркестратору и обратно в
-контекст не возвращаются.
+Тип задаёт только то, как ведущий пишет текст для игрока. Как рисуются кадры —
+отдельный набор настроек: что в кадре, когда рисовать, какого размера. Раньше
+это лежало внутри типа, и оттого половина типов оказалась одним и тем же с
+разными настройками картинок.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-#: Политики частоты генерации изображений.
-IMAGE_POLICIES: dict[str, str] = {
-    "never": "никогда",
-    "every_turn": "каждый ход",
-    "on_scene_change": "при смене сцены",
-    "every_n": "каждые N ходов",
-    "manual": "только по кнопке",
-    "idle": "в простое, если есть время",
-}
-
 
 @dataclass(frozen=True)
 class DialogueFormat:
-    """Один формат диалога."""
+    """Один тип повествования."""
 
     key: str
     title: str
@@ -34,15 +21,12 @@ class DialogueFormat:
     user_label: str
     #: Инструкция о том, как писать текст для игрока.
     prose_style: str
-    #: Ожидается ли блок ``<scene>``.
+    #: Ожидается ли блок ``<scene>``. Даже если да, рисовать его велит политика.
     wants_scene: bool
-    #: Роль картинки: иллюстрация к сцене, «фотография» в переписке или никакой.
+    #: Роль картинки: иллюстрация к сцене или «фотография» от собеседника.
     scene_role: str
-    #: Как рисовать текст: сплошной прозой, репликами или лентой сообщений.
+    #: Как рисовать текст: сплошной прозой или лентой сообщений.
     ui: str
-    default_image_policy: str
-    default_image_size: int
-    default_image_steps: int
     #: Нужно ли требовать блок предгенерации.
     wants_speculative: bool = False
 
@@ -53,21 +37,18 @@ class DialogueFormat:
             "title": self.title,
             "summary": self.summary,
             "user_label": self.user_label,
-            "prose_is_messages": self.ui in ("chat", "photo_chat"),
+            "prose_is_messages": self.ui == "chat",
             "wants_scene": self.wants_scene,
             "scene_role": self.scene_role,
             "ui": self.ui,
-            "default_image_policy": self.default_image_policy,
-            "default_image_size": self.default_image_size,
-            "default_image_steps": self.default_image_steps,
         }
 
 
 FORMATS: dict[str, DialogueFormat] = {
     "story": DialogueFormat(
         key="story",
-        title="История с описаниями",
-        summary="Проза от второго лица: обстановка, персонажи, реплики. Иллюстрация на смену сцены.",
+        title="История",
+        summary="Проза от второго лица: обстановка, персонажи, реплики.",
         user_label="Что делает игрок?",
         prose_style=(
             "Пиши живую прозу от второго лица, 2-4 абзаца. Описывай обстановку, "
@@ -78,100 +59,112 @@ FORMATS: dict[str, DialogueFormat] = {
         wants_scene=True,
         scene_role="illustration",
         ui="prose",
-        default_image_policy="on_scene_change",
-        default_image_size=1024,
-        default_image_steps=25,
         wants_speculative=True,
     ),
-    "story_terse": DialogueFormat(
-        key="story_terse",
-        title="История без описаний",
-        summary="Только действия и реплики, без пейзажных описаний. Дешевле по токенам и быстрее.",
+    "chat": DialogueFormat(
+        key="chat",
+        title="Чат",
+        summary="Переписка с одним собеседником. Если кадры включены, он присылает снимки с телефона.",
+        user_label="Твоё сообщение",
+        prose_style=(
+            "Ты ведёшь переписку с игроком от лица одного собеседника. Каждое "
+            "сообщение — отдельная строка, не длиннее двух предложений, и начинается "
+            "именем говорящего и двоеточием. Никаких описаний обстановки, действий и "
+            "ощущений: только текст сообщений. Одно-три сообщения за ход.\n"
+            "Собеседник пишет с телефона, поэтому он в курсе, где находится и что "
+            "делает: если занят, так и говорит и отвечает коротко. Он не описывает "
+            "себя со стороны — он пишет о себе словами."
+        ),
+        wants_scene=True,
+        scene_role="photo",
+        ui="chat",
+    ),
+    "quest": DialogueFormat(
+        key="quest",
+        title="Квест",
+        summary="Проза по написанному сюжету: места, предметы и этапы заданы заранее.",
         user_label="Что делает игрок?",
         prose_style=(
-            "Пиши скупо: только действия, реплики и то, что игрок обязан знать. "
-            "Никаких описаний обстановки, погоды и одежды. Один-два абзаца, короткие фразы. "
-            "Каждый ход двигает историю вперёд."
+            "Пиши живую прозу от второго лица, 2-4 абзаца. Описывай обстановку, "
+            "телесные ощущения, реплики персонажей. Каждый ход двигай сюжет к цели "
+            "этапа: не топчись на месте и не повторяй уже случившееся. "
+            "Не заканчивай ход вопросом «что ты будешь делать?» — ставь игрока перед фактом."
         ),
         wants_scene=True,
         scene_role="illustration",
         ui="prose",
-        default_image_policy="on_scene_change",
-        default_image_size=1024,
-        default_image_steps=20,
-    ),
-    "chat": DialogueFormat(
-        key="chat",
-        title="Просто чат",
-        summary="Мессенджер: короткие сообщения собеседника, без описаний вообще.",
-        user_label="Твоё сообщение",
-        prose_style=(
-            "Ты пишешь в мессенджере. Каждое сообщение — отдельная строка, не длиннее "
-            "двух предложений. Если говорит другой персонаж, начни строку его именем и "
-            "двоеточием. Никаких описаний действий и обстановки: только текст сообщений. "
-            "Одно-три сообщения за ход."
-        ),
-        wants_scene=False,
-        scene_role="none",
-        ui="chat",
-        default_image_policy="manual",
-        default_image_size=768,
-        default_image_steps=20,
-    ),
-    "chat_photo": DialogueFormat(
-        key="chat_photo",
-        title="Чат с фотками",
-        summary="Чатрулетка: собеседник присылает фотографию и комментирует её.",
-        user_label="Твоё сообщение",
-        prose_style=(
-            "Ты общаешься в чате и время от времени присылаешь фотографии. "
-            "Каждое сообщение — отдельная строка, не длиннее двух предложений, и "
-            "начинается именем говорящего и двоеточием. Никаких описаний "
-            "обстановки, действий и ощущений: только текст сообщений. Короткий "
-            "ответ — одна строка, обычный — две или три. "
-            "Когда присылаешь фотографию, опиши её в блоке scene — она покажется "
-            "как вложение к последнему сообщению. Фотография должна быть бытовой "
-            "и естественной, будто снята на телефон."
-        ),
-        wants_scene=True,
-        scene_role="photo",
-        ui="photo_chat",
-        default_image_policy="every_turn",
-        default_image_size=768,
-        default_image_steps=20,
-    ),
-    "chat_scene": DialogueFormat(
-        key="chat_scene",
-        title="Диалоги с картинками",
-        summary="Переписка персонажей, где картинка — кадр сцены, а не вложение.",
-        user_label="Реплика",
-        prose_style=(
-            "Пиши переписку двух-трёх персонажей. Каждая реплика — отдельная "
-            "строка, не длиннее двух предложений, в формате «Имя: текст». "
-            "Описаний нет, кроме коротких авторских ремарок в скобках. "
-            "Картинка иллюстрирует сцену, в которой идёт разговор."
-        ),
-        wants_scene=True,
-        scene_role="illustration",
-        ui="chat",
-        default_image_policy="on_scene_change",
-        default_image_size=1024,
-        default_image_steps=25,
     ),
 }
 
 DEFAULT_FORMAT = "story"
 
+#: Ключи типов, которые были раньше и различались только настройками картинок.
+#: Ведутся на нынешние, чтобы миры и партии не остались без типа.
+LEGACY_FORMATS: dict[str, str] = {
+    "story_terse": "story",
+    "chat_photo": "chat",
+    "chat_scene": "chat",
+}
+
 
 def get_format(key: str) -> DialogueFormat:
-    """Возвращает формат по ключу, подставляя формат по умолчанию.
+    """Возвращает тип повествования по ключу, подставляя запасной.
 
-    @param key: ключ формата.
-    @returns: описание формата.
+    @param key: ключ типа; понимаются и прежние ключи.
+    @returns: описание типа.
     """
-    return FORMATS.get(key, FORMATS[DEFAULT_FORMAT])
+    return FORMATS.get(normalize_format(key), FORMATS[DEFAULT_FORMAT])
+
+
+def normalize_format(key: str) -> str:
+    """Приводит ключ типа к нынешнему.
+
+    @param key: ключ типа, в том числе прежний.
+    @returns: нынешний ключ; пустая строка, если ключ незнаком.
+    """
+    cleaned = str(key or "").strip()
+    if cleaned in FORMATS:
+        return cleaned
+    return LEGACY_FORMATS.get(cleaned, "")
+
+
+def resolve_format(session_format: str, world_format: str) -> DialogueFormat:
+    """Тип повествования для партии.
+
+    Тип принадлежит партии, а не миру: один и тот же мир проходят и прозой, и
+    перепиской. Пустая строка у партии означает «как у мира» — так ведут себя
+    партии, заведённые до того, как тип переехал в партию. Незнакомый ключ тоже
+    уступает миру: он ближе к делу, чем общий запасной.
+
+    @param session_format: тип у партии.
+    @param world_format: тип у мира.
+    @returns: описание типа.
+    """
+    chosen = normalize_format(session_format)
+    if chosen:
+        return FORMATS[chosen]
+    return get_format(world_format)
+
+
+def effective_images(world: object, settings: object) -> tuple[str, str]:
+    """Когда рисовать кадры и что в них показывать.
+
+    Значения задаются у мира, а если у мира пусто — берутся из общих настроек.
+    Пустое значение у мира означает «как в настройках»: так ведут себя миры,
+    заведённые до того, как настройки картинок переехали в мир.
+
+    @param world: мир; допускается ``None``.
+    @param settings: настройки приложения.
+    @returns: пара «когда рисовать» и «что в кадре».
+    """
+    policy = str(getattr(world, "image_policy", "") or "").strip()
+    frame = str(getattr(world, "image_frame", "") or "").strip()
+    return (
+        policy or str(getattr(settings, "image_policy", "minimal") or "minimal"),
+        frame or str(getattr(settings, "chat_frame", "portrait") or "portrait"),
+    )
 
 
 def list_formats() -> list[dict[str, object]]:
-    """Все форматы для выпадающего списка в интерфейсе."""
+    """Все типы повествования для выпадающего списка в интерфейсе."""
     return [fmt.as_dict() for fmt in FORMATS.values()]

@@ -1,6 +1,6 @@
 """Запуск, остановка и наблюдение движка FreeToken.
 
-Оркестратор владеет жизненным циклом движка: на 12 GB VRAM текстовая модель и
+Оркестратор владеет жизненным циклом движка: на карте 12 ГБ текстовая модель и
 Qwen-Image-2.1 не помещаются одновременно, поэтому перед генерацией картинки
 движок останавливается, а после — поднимается заново.
 
@@ -161,6 +161,8 @@ class EngineController:
         self.client = FreeTokenClient(f"http://127.0.0.1:{port}", timeout_s=15.0)
         self.process: subprocess.Popen[bytes] | None = None
         self.log_path: Path | None = None
+        #: Почему не удалось запустить; пустая строка, если запуск прошёл.
+        self.start_error: str = ""
 
     # --- наблюдение ---------------------------------------------------------
 
@@ -240,27 +242,42 @@ class EngineController:
 
     # --- запуск -------------------------------------------------------------
 
-    def start(self, cfg: EngineConfig) -> subprocess.Popen[bytes]:
+    def start(self, cfg: EngineConfig) -> subprocess.Popen[bytes] | None:
         """Запускает движок отсоединённым процессом.
 
         Процесс переживает выход оркестратора, поэтому его PID нужно хранить:
         осиротевший движок продолжит держать VRAM.
 
         @param cfg: конфигурация запуска.
-        @returns: handle запущенного процесса.
+        @returns: handle запущенного процесса; ``None``, если запустить не удалось.
         """
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = self.log_dir / f"engine_{cfg.name}.log"
-        log_file = self.log_path.open("ab")
         argv = cfg.argv(self.ft_exe)
-        self.process = subprocess.Popen(
-            argv,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            creationflags=_CREATE_FLAGS,
-            cwd=str(self.ft_exe.parent),
-        )
+        program = Path(argv[0])
+        if not program.is_file():
+            # Проверка до Popen: иначе Windows отвечает «не удаётся найти
+            # указанный файл», и причина установки в ошибке не видна.
+            self.start_error = f"нет файла запуска {program}"
+            return None
+        log_file = self.log_path.open("ab")
+        try:
+            self.process = subprocess.Popen(
+                argv,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                creationflags=_CREATE_FLAGS,
+                cwd=str(program.parent),
+            )
+        except OSError as exc:
+            # Файл мог исчезнуть между проверкой и запуском, а сама сборка —
+            # не запуститься. Причина возвращается наверх.
+            self.start_error = f"{program.name}: {exc}"
+            log_file.close()
+            return None
+        self.start_error = ""
+        log_file.close()
         return self.process
 
     def wait_ready(
@@ -353,6 +370,14 @@ class EngineController:
         ram_before = metrics.ram_stats()
         spawned_at = time.time()
         self.start(cfg)
+        if self.process is None:
+            # Причина уже записана движком: файла нет либо сборка не запустилась.
+            return {
+                "ready": False,
+                "error": self.start_error or "движок не запустился",
+                "seconds": 0.0,
+                "timeline": {"errors": [self.start_error or "движок не запустился"]},
+            }
         pid = self.process.pid if self.process else None
         timeline = self.wait_ready(spawned_at, timeout_s=timeout_s)
         report: dict[str, Any] = {
@@ -408,7 +433,7 @@ class EngineController:
             report["first_token"] = {"error": str(exc)}
 
         # vram_bytes движок заполняет только после первого запроса: до него поле
-        # равно нулю, и замер по нему дал бы ложный ноль.
+        # равно нулю, и опираться на него нельзя.
         try:
             report["engine_vram_mb"] = round(
                 (self.client.stats().get("vram_bytes") or 0) / (1024 * 1024)

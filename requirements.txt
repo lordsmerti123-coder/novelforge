@@ -1,0 +1,5 @@
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.6
+psutil>=5.9
+pillow>=10.0

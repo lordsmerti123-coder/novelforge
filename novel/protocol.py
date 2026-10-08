@@ -25,16 +25,35 @@ SPECULATIVE = "speculative"
 NOTES = "notes"
 #: Блок с тем, как персонажи выглядят теперь: переоделся, ранен, загримирован.
 LOOKS = "looks"
+#: Блок состояния квеста: куда игрок перешёл, что взял и применил, кончился ли
+#: квест. Ставится только в режиме квеста.
+QUEST = "quest"
 
 _TAG_RE = re.compile(
     # Список блоков собирается из констант: добавив блок, нельзя забыть про
     # разбор — иначе он молча не находится.
-    r"<(?P<name>" + "|".join((PROSE, SCENE, SPECULATIVE, NOTES, LOOKS)) + r")\b[^>]*>"
+    r"<(?P<name>" + "|".join((PROSE, SCENE, SPECULATIVE, NOTES, LOOKS, QUEST)) + r")\b[^>]*>"
     r"(?P<body>.*?)(?:</(?P=name)\s*>|\Z)",
     re.IGNORECASE | re.DOTALL,
 )
 _FENCE_RE = re.compile(r"^\s*```[a-zA-Z]*\s*|\s*```\s*$")
 _TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
+
+
+def strip_machine_tags(text: str) -> tuple[str, list[str]]:
+    """Вырезает машинные блоки из текста, уходящего игроку.
+
+    Служит последней проверкой перед записью в историю: если разбор почему-то не
+    отделил блок, он не должен попасть в партию. Имена вырезанных блоков
+    возвращаются, чтобы вызывающий мог сказать об этом в журнале.
+
+    @param text: текст ответа ведущего.
+    @returns: очищенный текст и имена вырезанных блоков.
+    """
+    names = [match.group("name").lower() for match in _TAG_RE.finditer(text)]
+    if not names:
+        return text, []
+    return _TAG_RE.sub("", text).strip(), names
 
 
 @dataclass
@@ -87,13 +106,15 @@ class ParsedReply:
     dropped_notes: list[int] = field(default_factory=list)
     #: Как персонажи выглядят теперь: имя — описание.
     looks: dict[str, str] = field(default_factory=dict)
+    #: Отчёт квеста: переход, взятое, применённое, номер этапа, исход.
+    quest: dict[str, Any] = field(default_factory=dict)
 
     @property
     def has_machine_block(self) -> bool:
         """Есть ли что-то для оркестратора, кроме текста для игрока."""
         return (self.scene is not None or bool(self.speculative)
                 or bool(self.fulfilled_notes) or bool(self.dropped_notes)
-                or bool(self.looks))
+                or bool(self.looks) or bool(self.quest))
 
     def as_dict(self) -> dict[str, Any]:
         """Представление для журнала и отчёта."""
@@ -173,6 +194,16 @@ def loads_json(body: str) -> Any:
             return json.loads(candidate, strict=False)
         except json.JSONDecodeError as exc:
             last_error = exc
+            # «Extra data» значит, что разбираемое значение кончилось, а текст
+            # после него остался: модель дописала ещё один объект или пояснение.
+            # Первое значение при этом разобрано верно — берём его, а не теряем
+            # весь блок.
+            if exc.msg == "Extra data":
+                try:
+                    value, _ = json.JSONDecoder(strict=False).raw_decode(candidate.lstrip())
+                    return value
+                except json.JSONDecodeError:
+                    pass
             continue
     raise last_error or json.JSONDecodeError("пустой блок", "", 0)
 
@@ -454,9 +485,8 @@ def parse_reply(text: str) -> ParsedReply:
         result.prose = blocks[PROSE].strip()
     elif not blocks:
         # Модель иногда отвечает не тегами, а целым объектом JSON:
-        # ``{"prose": "...", "scene": {...}}``. Без этого разбора объект уходил
-        # игроку как текст, а сцена внутри него пропадала — на практике в чат
-        # попал сырой JSON, и кадр не нарисовался.
+        # ``{"prose": "...", "scene": {...}}``. Без этого разбора объект уходил бы
+        # игроку как текст, а сцена внутри него пропадала.
         if _parse_json_reply(text, result):
             return result
         result.prose = text.strip()
@@ -509,5 +539,17 @@ def parse_reply(text: str) -> ParsedReply:
             result.looks = _as_looks(loads_json(blocks[LOOKS]))
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             result.errors.append(f"looks: некорректный блок ({exc})")
+
+    if QUEST in blocks:
+        # Блок только для режима квеста: без него квест остаётся на месте, и
+        # ведущий получает об этом напоминание следующим ходом.
+        try:
+            payload = loads_json(blocks[QUEST])
+            if isinstance(payload, dict):
+                result.quest = payload
+            else:
+                result.errors.append("quest: блок должен быть объектом")
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            result.errors.append(f"quest: некорректный блок ({exc})")
 
     return result

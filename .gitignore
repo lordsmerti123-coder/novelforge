@@ -33,6 +33,8 @@ rewrite_*.py
 ИНСТРУКЦИЯ-*.md
 ПРАВИЛА-*.md
 ОТЧЁТ-*.md
+КАРТА-*.md
+ЖУРНАЛ-*.md
 
 # Данные и модели: в репозиторий не входят.
 *.gguf
@@ -69,3 +71,12 @@ comfy-shared/
 .idea/
 Thumbs.db
 desktop.ini
+
+# Данные и отчёты: создаются при работе, в репозиторий не входят.
+data/
+bench/measurements/
+.env
+*.db
+*.db-shm
+*.db-wal
+*.bak

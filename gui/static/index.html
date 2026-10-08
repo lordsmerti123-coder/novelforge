@@ -39,6 +39,20 @@
   .badge.ok{background:#1e3a24;color:var(--ok)}
   .badge.warn{background:#3a3320;color:var(--warn)}
   .badge.err{background:#3a1e22;color:var(--err)}
+  /* Сводка готовности: показывается, когда чего-то не хватает. Новый
+     пользователь на чистой машине должен видеть причину, а не пустые списки. */
+  .setup{background:#2a2413;border-bottom:1px solid var(--warn);
+    padding:8px 12px;font-size:12px;max-height:210px;overflow:auto}
+  .setup[hidden]{display:none}
+  .setup h4{margin:0 0 6px;font-size:12px;color:var(--warn);font-weight:600}
+  .setup .row{display:flex;gap:8px;margin:0 0 5px;align-items:baseline}
+  .setup .row .mark{flex:0 0 auto;font-weight:700}
+  .setup .row.bad .mark{color:var(--err)}
+  .setup .row.good .mark{color:var(--ok)}
+  .setup .row .name{flex:0 0 150px;color:var(--text)}
+  .setup .row .why{flex:1 1 auto;color:var(--tok)}
+  .setup .row .how{flex:1 1 auto;color:var(--warn)}
+  .setup button{margin-top:4px}
   .frame-mark{margin-top:6px;font-size:12px;color:var(--tok);cursor:pointer;
     border-left:3px solid var(--accent);padding-left:8px}
   .frame-mark:hover{color:var(--text)}
@@ -151,10 +165,12 @@
   <button class="ghost" id="btn-panel" title="Скрыть или показать правую панель — диалог станет шире, а кадры перейдут в текст">панель</button>
   <button class="ghost" id="btn-tools" title="Показать или скрыть поля врезки и заметок">врезки</button>
   <button class="ghost" id="btn-engine-start">Поднять движок</button>
+        <button class="ghost" id="btn-engine-stop" title="освободить видеопамять, не трогая генератор кадров">Остановить движок</button>
   <button class="danger" id="btn-kill">Стоп всё</button>
 </header>
 
 <main>
+  <div id="setup" class="setup" hidden></div>
   <div id="phase" class="phasebar">
     <span class="dot"></span>
     <span id="phase-text" class="grow"></span>
@@ -216,6 +232,10 @@
       <div class="row-line"><button class="ghost" id="btn-export-session">Выгрузить партию</button>
         <button class="ghost" id="btn-clear">Очистить партию</button>
         <button class="danger" id="btn-drop-session">Удалить партию</button></div>
+      <div class="field"><label>Тип повествования этой партии</label>
+        <select id="s-format"></select>
+        <div class="tok">Действует со следующего хода. Прошлые ходы остаются как были.</div>
+        <div id="session-note" class="note"></div></div>
       <div id="session-stats" class="card"></div>
       <div id="issues"></div>
       <h3 style="font-size:13px;margin:14px 0 6px">Память</h3>
@@ -307,7 +327,12 @@
       </div>
       <div class="grid2">
         <div class="field"><label>Название</label><input id="w-name"></div>
-        <div class="field"><label>Формат диалога</label><select id="w-format"></select></div>
+        <div class="field"><label>Тип повествования по умолчанию</label><select id="w-format"></select>
+          <div class="tok">С ним заводится новая партия. У каждой партии свой тип — он меняется в панели «Эта партия».</div></div>
+        <div class="field"><label>когда рисовать кадры</label><select id="w-image_policy"></select>
+          <div class="tok">«Как в настройках» берёт значение со вкладки «Машина». Заготовка подставляет своё.</div></div>
+        <div class="field"><label>что в кадре</label><select id="w-image_frame"></select>
+          <div class="tok">Персонаж — собеседник крупным планом, как его видит игрок. Сцена — общий план с обстановкой.</div></div>
         <div class="field"><label>Жанр</label><input id="w-genre"></div>
         <div class="field"><label>Тон</label><input id="w-tone"></div>
         <div class="field"><label>Повествование</label><input id="w-narrator"></div>
@@ -336,6 +361,7 @@
       <div id="characters"></div>
       <div class="row-line"><input id="char-name" placeholder="имя" style="max-width:160px">
         <input id="char-appearance" class="grow" placeholder="внешность по-английски — уходит генератору кадров">
+            <button class="ghost" id="btn-char-voice" title="образцы сообщений: по одной строке на сообщение">переписка</button>
         <button class="ghost" id="btn-add-char">+</button></div>
       <h3 style="font-size:13px;margin:14px 0 6px">Вещи <span class="tok" id="items-count"></span></h3>
       <div id="items"></div>
@@ -365,6 +391,17 @@
         </select>
       </div>
       <div id="engine-note" class="p"></div>
+
+      <h3 style="font-size:13px;margin:14px 0 8px">Модель</h3>
+      <div class="row-line"><select id="model-select" class="grow"></select>
+        <button class="ghost" id="btn-apply-model">Выбрать (с пресетом)</button></div>
+      <div id="model-note" class="p"></div>
+      <div class="field"><label>Каталоги с моделями</label>
+        <input id="f-models_dirs" placeholder="например C:\models">
+        <span class="hint">Где искать чекпоинты. Несколько каталогов — через
+          <b>;</b>. Программа обходит их и показывает, что нашла: каталоги HF,
+          родной формат FTW и GGUF-файлы. Пусто — папка <b>models</b> рядом с
+          проектом.</span></div>
 
       <div id="external-settings" style="display:none">
         <div class="field"><label>Путь к llama-server.exe</label>
@@ -404,7 +441,7 @@
       <p class="hint">Кадры рисует ComfyUI. Где он установлен, у каждого своё,
         поэтому путь указывается здесь. Пусто — значения по умолчанию.</p>
       <div class="field"><label>Каталог ComfyUI</label>
-        <input id="f-comfy_root" placeholder="например D:\ComfyUI\ComfyUI\ComfyUI">
+        <input id="f-comfy_root" placeholder="например C:\ComfyUI">
         <span class="hint">Внутри должны лежать <b>.venv</b> и <b>main.py</b>.
           Именно этот <b>main.py</b> и запускается питоном — отдельного скрипта
           для Qwen-Image не нужно.</span></div>
@@ -427,21 +464,6 @@
         <button class="ghost" id="btn-comfy-check">Проверить пути</button>
       </div>
       <div id="comfy-note" class="p"></div>
-
-      <h3 style="font-size:13px;margin:14px 0 8px">Локальные модели</h3>
-      <div class="field"><label>Каталоги с моделями</label>
-        <input id="f-models_dirs" placeholder="например D:\models">
-        <span class="hint">Где искать чекпоинты. Несколько каталогов — через
-          <b>;</b>. Программа обходит их и показывает, что нашла: каталоги HF,
-          родной формат FTW и GGUF-файлы. Пусто — папка <b>models</b> рядом с
-          проектом.</span></div>
-      <div class="row-line"><select id="model-select" class="grow"></select>
-        <button class="ghost" id="btn-apply-model">Выбрать (с пресетом)</button></div>
-      <div class="row-line"><button class="ghost" id="btn-refresh-models"
-        title="Перечитать папку с моделями: новые файлы появляются без перезапуска"
-        >Обновить список</button></div>
-      <div id="model-note" class="p"></div>
-      <p class="hint" id="models-hint">GGUF-файлы грузит только внешний движок.</p>
 
       <h3 style="font-size:13px;margin:14px 0 8px">Сэмплинг</h3>
       <div class="grid2">
@@ -481,7 +503,8 @@
         <div class="field"><label>частота</label><select id="f-image_policy"></select></div>
         <div class="field"><label>каждые N ходов</label><input id="f-image_every_n" type="number"></div>
         <div class="field"><label>качество кадра</label><select id="f-image_quality"></select></div>
-        <div class="field"><label>что рисовать в переписке</label><select id="f-chat_frame"></select></div>
+        <div class="field"><label>что в кадре</label><select id="f-chat_frame"></select>
+          <div class="tok">Персонаж — собеседник крупным планом, как его видит игрок. Сцена — общий план с обстановкой. Работает во всех типах повествования.</div></div>
         <div class="field"><label>размер (при «своих числах»)</label><input id="f-image_size" type="number" step="32"></div>
         <div class="field"><label>шагов (при «своих числах»)</label><input id="f-image_steps" type="number"></div>
         <div class="field"><label>промпт картинки</label><select id="f-image_prompt_mode">
@@ -531,6 +554,8 @@
 
       <div class="row-line"><button id="btn-save-settings">Сохранить настройки</button>
         <span id="settings-note" class="tok"></span></div>
+
+      <div id="machine-setup"></div>
     </div>
 
     <div class="tabbody" id="tab-debug">
@@ -628,6 +653,22 @@ async function api(path, method="GET", body){
   if (!res.ok){ let d = res.statusText; try{ d = (await res.json()).detail || d; }catch(e){} throw new Error(d); }
   return res.status === 204 ? null : res.json();
 }
+// Русские числительные: «1 персонаж», «2 персонажа», «5 персонажей».
+// Длинное значение показывается целиком до предела, дальше — с многоточием.
+// Прежде аргументы резались на 60 знаках, и тело правила обрывалось на
+// полуслове: по журналу нельзя было понять, что записал агент.
+function shorten(value, limit){
+  const text = String(value);
+  return text.length > limit ? text.slice(0, limit) + "…" : text;
+}
+
+function plural(n, one, few, many){
+  const ten = n % 10, hundred = n % 100;
+  if (ten === 1 && hundred !== 11) return one;
+  if (ten >= 2 && ten <= 4 && (hundred < 12 || hundred > 14)) return few;
+  return many;
+}
+
 function note(el, text, ms=2500){ const e=$(el); e.textContent = text; setTimeout(()=>{e.textContent="";}, ms); }
 
 /* ---------- отрисовка диалога ---------- */
@@ -904,6 +945,8 @@ function renderWorld(doc){
   S.world = doc.world;
   $("w-name").value = doc.world.name;
   $("w-format").value = doc.world.format;
+  if ($("w-image_policy")) $("w-image_policy").value = doc.world.image_policy || "";
+  if ($("w-image_frame")) $("w-image_frame").value = doc.world.image_frame || "";
   $("w-genre").value = doc.world.genre;
   $("w-tone").value = doc.world.tone;
   $("w-narrator").value = doc.world.narrator;
@@ -976,6 +1019,7 @@ async function delItem(id){
 async function saveWorld(){
   await api(`/api/worlds/${S.world.id}`, "POST", {changes:{
     name:$("w-name").value, format:$("w-format").value, genre:$("w-genre").value,
+      image_policy:$("w-image_policy").value, image_frame:$("w-image_frame").value,
     tone:$("w-tone").value, narrator:$("w-narrator").value, style:$("w-style").value,
     brief:$("w-brief").value, hidden_rules:$("w-hidden").value,
     image_suffix:$("w-image_suffix").value}});
@@ -1006,6 +1050,9 @@ async function refreshHistory(){
   const data = await api(`/api/sessions/${S.sessionId}/history`);
   S.history = data;
   S.fmt = data.format;
+  // В списке стоит то, что выбрано у партии, а не действующий формат: иначе
+  // «как у мира» было бы не отличить от явного выбора того же формата.
+  $("s-format").value = (data.session && data.session.format) || "";
   $("format-title").textContent = data.format.title;
   $("input").placeholder = (data.format.user_label || "Реплика") + " (Ctrl+Enter — отправить)";
   renderMessages(data);
@@ -1223,20 +1270,33 @@ function renderStatus(doc){
     : "";
 
   const shortModel = (eng.model || "").split("-").slice(0,2).join("-");
-  if (eng.healthy)
+  if (eng.healthy && eng.external && !eng.model){
+    // Сервер отвечает, но модели в нём нет: говорить нечем. Зелёный значок с
+    // именем из настроек обещал бы ответ, которого не будет.
+    $("engine").textContent = "модель не загружена" +
+      (eng.wanted ? ` · выбрана ${esc(eng.wanted)}` : "");
+    $("engine").className = "badge warn";
+  } else if (eng.healthy){
     // Объём не показываем нулём: движок отдаёт его только после первого запроса.
     $("engine").textContent = shortModel +
       (eng.vram_mb ? ` · ${fmtGb(eng.vram_mb)}` : "") +
       (eng.tps ? ` · ${Math.round(eng.tps)} т/с` : "");
-  else if (eng.port_pid) $("engine").textContent = "движок не отвечает";
-  else $("engine").textContent = "движок остановлен";
-  $("engine").className = "badge " + (eng.healthy?"ok":"warn");
+    $("engine").className = "badge ok";
+  } else if (eng.port_pid){
+    $("engine").textContent = "движок не отвечает";
+    $("engine").className = "badge warn";
+  } else {
+    $("engine").textContent = "движок остановлен";
+    $("engine").className = "badge warn";
+  }
   $("engine").title = eng.geometry ? `Контекст ${eng.ctx || "?"}\n${eng.geometry}` : "";
 
   if (comfy.alive)
     $("comfy").textContent = comfy.models_loaded ? "ComfyUI: модели в памяти" : "ComfyUI выгружен";
   else $("comfy").textContent = "ComfyUI нет";
-  $("comfy").className = "badge " + (comfy.alive ? (comfy.models_loaded ? "warn" : "ok") : "warn");
+  // Отсутствие сервера и загруженные модели — разные состояния, одним жёлтым
+  // они не различались.
+  $("comfy").className = "badge " + (comfy.alive ? (comfy.models_loaded ? "warn" : "ok") : "err");
 
   $("task").textContent = task.running ? `${task.kind} · ${fmtDur(task.elapsed_s)}` : "";
   $("task").className = "badge warn";
@@ -1341,8 +1401,8 @@ function fillQualitySelects(options){
     + '<option value="custom">свои числа (поля ниже)</option>';
   for (const id of ["f-image_quality","scenes-quality"]) if ($(id)) $(id).innerHTML = html;
   if ($("f-chat_frame")) $("f-chat_frame").innerHTML =
-    '<option value="portrait">портрет собеседника</option>'
-    + '<option value="scene">сцену целиком</option>';
+    '<option value="portrait">персонаж — крупным планом</option>'
+    + '<option value="scene">сцена — общий план</option>';
   if ($("scenes-quality") && S.settings) $("scenes-quality").value = S.settings.image_quality || "normal";
   if ($("f-image_quality")) $("f-image_quality").onchange = showQualityHint;
 }
@@ -1372,12 +1432,13 @@ async function saveSettings(){
   // Смена движка меняет и список моделей: GGUF доступны только на внешнем.
   if (r.engine) await loadSettings();
   await loadModels(true);
+  // Пути и движок влияют на готовность, поэтому сводка перечитывается.
+  await loadSetup(true);
 }
 async function loadModels(refresh=false){
   const d = await api("/api/models"+(refresh?"?refresh=true":""));
-  // Сервер присылает только то, что подходит текущему движку: у llama.cpp это
-  // GGUF, у FreeToken — каталоги HF и FTW. Показывать оба набора вперемешку
-  // значит предлагать строки, которые заведомо не запустятся.
+  // В списке только модели текущего движка. Список подстраивается под выбор
+  // движка выше, поэтому переключать его нужно там, а не строкой в списке.
   const option = (m) => `<option value="${esc(m.path)}"
       ${m.path===d.current?"selected":""}>
       ${esc(m.name)} · ${m.model_type} · ${m.size_gb} GB</option>`;
@@ -1385,12 +1446,13 @@ async function loadModels(refresh=false){
 
   const cur = d.models.find(m=>m.path===d.current);
   const engineName = d.engine_kind === "external" ? "llama.cpp" : "FreeToken";
-  const hidden = d.hidden ? ` Скрыто ${d.hidden} — они для другого движка.` : "";
+  // Модели другого движка в список не попадают: их видно, только переключив
+  // движок. Сколько их там, сообщается, чтобы список не выглядел обрезанным.
+  const other = d.other_engine
+    ? ` Ещё ${d.other_engine} — на другом движке, переключите селектор выше.` : "";
   $("model-note").textContent = (cur
     ? `${cur.kind.toUpperCase()}, ${cur.model_type}${cur.experts?`, MoE ${cur.experts} экспертов`:""}. ${cur.note||""}`
-    : "модель не найдена в реестре") + ` Движок: ${engineName}.${hidden}`;
-  const btn = $("btn-refresh-models");
-  if (btn) btn.textContent = `Обновить список (${d.models.length} под ${engineName})`;
+    : "модель не найдена в реестре") + ` Движок: ${engineName}.${other}`;
 }
 async function applyModel(){
   const path = $("model-select").value;
@@ -1424,6 +1486,69 @@ async function tick(){
   }
 }
 
+/* ---------- готовность: чего не хватает на машине ---------- */
+
+// Панель поверх страницы показывается, только когда работать нечем: нет
+// движка или моделей. Отсутствие ComfyUI или чужого сервера — не беда, о них
+// сообщается во вкладке «Машина», а не перед лицом на каждой вкладке.
+let setupLoaded = false;
+let setupCache = null;
+async function loadSetup(force=false){
+  if (setupLoaded && !force) return;
+  setupLoaded = true;
+  let d;
+  try { d = await api("/api/readiness"); } catch(e){ return; }
+  setupCache = d;
+  renderSetup();
+  renderMachineSetup();
+}
+function setupRows(items){
+  return items.map(c => `
+    <div class="row bad">
+      <span class="mark">✗</span>
+      <span class="name">${esc(c.title)}</span>
+      <span class="why">${esc(c.detail)}</span>
+    </div>
+    ${c.hint ? `<div class="row bad"><span class="mark"></span>
+      <span class="name"></span><span class="how">${esc(c.hint)}</span></div>` : ""}`).join("");
+}
+function renderSetup(){
+  const box = $("setup");
+  if (!box || !setupCache) return;
+  const blocking = setupCache.blocking || [];
+  if (!blocking.length){
+    // Ничего обязательного не сломано — панель убирается совсем.
+    box.hidden = true; box.innerHTML = "";
+    return;
+  }
+  const head = setupCache.text_ready
+    ? "Нечем вести историю полностью: часть возможностей недоступна."
+    : "Пока нечем вести историю — нет движка или моделей.";
+  box.innerHTML = `<h4>${esc(head)}</h4>${setupRows(blocking)}
+    <button class="ghost" id="btn-setup-again">Проверить снова</button>`;
+  box.hidden = false;
+  $("btn-setup-again").onclick = () => loadSetup(true);
+}
+// Во вкладке «Машина» видно всё, включая необязательное: там это уместно.
+function renderMachineSetup(){
+  const box = $("machine-setup");
+  if (!box || !setupCache) return;
+  const rows = (setupCache.checks || []).map(c => `
+    <div class="row ${c.ok?"good":"bad"}">
+      <span class="mark">${c.ok?"✓":"✗"}</span>
+      <span class="name">${esc(c.title)}</span>
+      <span class="${c.ok?"why":"why"}">${esc(c.detail)}</span>
+    </div>`).join("");
+  const opt = (setupCache.optional_missing || []).length;
+  const note = opt
+    ? `<p class="hint">Необязательное отмечено крестиком: история работает и без него.</p>`
+    : "";
+  box.innerHTML = `<h3 style="font-size:13px;margin:14px 0 8px">Что найдено на машине</h3>
+    ${note}${rows}
+    <div class="row-line"><button class="ghost" id="btn-setup-again2">Проверить снова</button></div>`;
+  $("btn-setup-again2").onclick = () => loadSetup(true);
+}
+
 $("sel-world").onchange = async e => { S.worldId = Number(e.target.value); S.sessionId = null; await loadWorld(S.worldId); await refreshHistory(); refreshAgentContext(); rememberLast(); };
 $("sel-session").onchange = async e => { S.sessionId = Number(e.target.value); await refreshHistory(); rememberLast(); };
 
@@ -1436,14 +1561,21 @@ $("btn-new-world").onclick = async () => {
 $("btn-new-session").onclick = async () => {
   if (!S.world) return;
   const title = prompt("Название партии:", "Партия"); if (title === null) return;
-  const r = await api("/api/sessions","POST",{world_id:S.world.id, title});
+  // Новая партия берёт формат у мира: его и подставляем, а сменить можно потом.
+  const r = await api("/api/sessions","POST",{world_id:S.world.id, title, format:S.world.format || ""});
   await loadWorld(S.world.id); $("sel-session").value = r.session_id; S.sessionId = r.session_id;
   await refreshHistory();
 };
-$("btn-add-look").onclick = addLook;
-$("btn-refresh-models").onclick = async () => {
-  try { await loadModels(true); } catch(e){ alert("Не получилось: " + e.message); }
+
+// Формат принадлежит партии: один мир проходят и прозой, и перепиской.
+$("s-format").onchange = async e => {
+  if (!S.sessionId) return;
+  const r = await api(`/api/sessions/${S.sessionId}/format`, "POST", {format:e.target.value});
+  if (r.rejected && r.rejected.length) { note("session-note", r.rejected[0]); return; }
+  note("session-note", "формат сохранён, действует со следующего хода");
+  await refreshHistory();
 };
+$("btn-add-look").onclick = addLook;
 $("btn-invent").onclick = inventNotes;
 // Проверка путей к ComfyUI: пользователь вводит их руками, и ошибка иначе
 // всплыла бы только при первом кадре, через несколько минут ожидания.
@@ -1553,10 +1685,12 @@ $("btn-add-rule").onclick = async () => {
   await api(`/api/worlds/${S.world.id}/rules`,"POST",{body, title:$("rule-title").value.trim()});
   $("rule-body").value = ""; $("rule-title").value = ""; await loadWorld(S.world.id);
 };
+$("btn-char-voice").onclick = () => { const b = $("char-voice-box"); b.hidden = !b.hidden; };
 $("btn-add-char").onclick = async () => {
   const name = $("char-name").value.trim(); if (!name) return;
-  await api(`/api/worlds/${S.world.id}/characters`,"POST",{name, appearance:$("char-appearance").value.trim()});
-  $("char-name").value = ""; $("char-appearance").value = ""; await loadWorld(S.world.id);
+  await api(`/api/worlds/${S.world.id}/characters`,"POST",{name, appearance:$("char-appearance").value.trim(), voice:$("char-voice").value.trim()});
+  $("char-name").value = ""; $("char-appearance").value = ""; $("char-voice").value = "";
+  await loadWorld(S.world.id);
 };
 $("btn-add-item").onclick = addItem;
 $("item-name").onkeydown = e => { if (e.key === "Enter"){ e.preventDefault(); addItem(); } };
@@ -1692,6 +1826,13 @@ const startEngine = async () => {
   try { await api("/api/engine/start", "POST"); } catch(e){ alert(e.message); }
 };
 $("btn-engine-start").onclick = startEngine;
+$("btn-engine-stop").onclick = async () => {
+  // Только движок: генератор кадров остаётся поднятым, если он был нужен.
+  const r = await api("/api/engine/stop", "POST", {});
+  const freed = r && r.freed_mb ? `, свободно ${r.freed_mb} МБ` : "";
+  note("engine-note", "движок остановлен" + freed);
+  // Состояние обновит обычный опрос: своей функции обновления тут нет.
+};
 if ($("btn-start-engine")) $("btn-start-engine").onclick = startEngine;
 $("btn-kill").onclick = async () => {
   if (!confirm("Остановить движок и сервер ComfyUI? Все процессы будут погашены.")) return;
@@ -1700,7 +1841,13 @@ $("btn-kill").onclick = async () => {
 };
 $("btn-save-settings").onclick = saveSettings;
 $("btn-apply-model").onclick = applyModel;
-if ($("f-engine_kind")) $("f-engine_kind").onchange = showEngineFields;
+if ($("f-engine_kind")) $("f-engine_kind").onchange = async () => {
+  showEngineFields();
+  // Смена движка применяется сразу: у FreeToken и llama.cpp разные наборы
+  // моделей, и список под прежний движок показывал бы то, что не запустится.
+  // Отдельная кнопка «сохранить» для этого не нужна.
+  await saveSettings();
+};
 $("btn-dump").onclick = loadDebug;
 
 /* ---------- агент-редактор ---------- */
@@ -1726,13 +1873,13 @@ function renderAgentRun(run){
       const result = (step.results || [])[i] || {};
       const op = action.op;
       const args = Object.entries(action).filter(([k]) => k !== "op")
-        .map(([k, v]) => `${k}: ${String(v).slice(0,60)}`).join(", ");
+        .map(([k, v]) => `${k}: ${shorten(v, 400)}`).join(", ");
       const mark = result.preview ? '<span class="badge warn">будет сделано</span>'
         : result.ok ? '<span class="badge ok">готово</span>'
         : `<span class="badge err">${esc(result.error || "ошибка")}</span>`;
       const detail = result.preview ? "" :
         Object.entries(result).filter(([k, v]) => !["op","ok","changed","preview"].includes(k)
-          && typeof v !== "object").map(([k, v]) => `${k}=${String(v).slice(0,50)}`).join(", ");
+          && typeof v !== "object").map(([k, v]) => `${k}=${shorten(v, 400)}`).join(", ");
       html += `<div class="row-line" style="padding-left:10px">
         <span class="grow"><code>${esc(op)}</code> ${esc(args)}</span>${mark}</div>`;
       if (detail) html += `<div class="tok" style="padding-left:20px">${esc(detail)}</div>`;
@@ -1931,7 +2078,33 @@ document.querySelectorAll(".tabs button").forEach(btn => {
 (async function boot(){
   const [formats, presets] = await Promise.all([api("/api/formats"), api("/api/presets")]);
   $("w-format").innerHTML = formats.map(f=>`<option value="${f.key}" title="${esc(f.summary)}">${esc(f.title)}</option>`).join("");
-  $("preset-select").innerHTML = presets.map(p=>`<option value="${p.key}">${esc(p.title)} · ${p.rules} правил, ${p.characters} персонажей</option>`).join("");
+  // У мира пустое значение означает «как в настройках» — так ведут себя миры,
+  // заведённые до того, как настройки картинок переехали в мир.
+  const blank = '<option value="">как в настройках</option>';
+  $("w-image_policy").innerHTML = blank + [["minimal","минимум картинок"],["master","как решит ведущий"],
+    ["on_scene_change","при смене сцены"],["every_turn","каждый ход"],["every_n","каждые N ходов"],
+    ["manual","только по кнопке"],["never","никогда"],["idle","в простое"]]
+    .map(([v,n])=>`<option value="${v}">${n}</option>`).join("");
+  $("w-image_frame").innerHTML = blank
+    + '<option value="scene">сцена — общий план</option>'
+    + '<option value="portrait">персонаж — крупным планом</option>';
+  // У партии первым идёт «как у мира»: пустое значение означает, что формат
+  // берётся у мира. Так же ведут себя партии, заведённые раньше.
+  $("s-format").innerHTML = `<option value="">как у мира</option>`
+    + formats.map(f=>`<option value="${f.key}" title="${esc(f.summary)}">${esc(f.title)}</option>`).join("");
+  // Квесты и заготовки идут одним списком: у квеста написан сюжет, поэтому в
+  // подписи стоит число мест и этапов, а не только правил.
+  // У каждого пункта подписан тип повествования: без подписи историю от
+  // переписки в списке не отличить — они выглядят одинаково.
+  $("preset-select").innerHTML = presets.map(p => {
+    const kind = (p.format_title || "История").toUpperCase();
+    const what = p.kind === "quest"
+      ? `${p.stages} ${plural(p.stages, "этап", "этапа", "этапов")}, `
+        + `${p.locations} ${plural(p.locations, "место", "места", "мест")}`
+      : `${p.rules} ${plural(p.rules, "правило", "правила", "правил")}, `
+        + `${p.characters} ${plural(p.characters, "персонаж", "персонажа", "персонажей")}`;
+    return `<option value="${p.key}">${kind} · ${esc(p.title)} · ${what}</option>`;
+  }).join("");
   const pol = await api("/api/settings");
   $("f-image_policy").innerHTML = [["minimal","минимум картинок (рекомендуется)"],
     ["master","как решит ведущий"],["on_scene_change","при смене сцены"],
@@ -1947,6 +2120,7 @@ document.querySelectorAll(".tabs button").forEach(btn => {
   ].map(([v,t])=>`<option value="${v}">${t}</option>`).join("");
   fillQualitySelects(pol.image_quality_options || []);
   await loadSettings(); await loadModels(); await loadWorlds();
+  await loadSetup();
   const last = lastOpened();
   const pick = S.worlds.find(w => w.id === last.world) || S.worlds[0];
   if (pick){

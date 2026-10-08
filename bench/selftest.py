@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from novel.console import setup_console  # noqa: E402
 from novel.context import ContextBuilder, estimate_tokens  # noqa: E402
 from novel.db import NovelDB  # noqa: E402
-from novel.formats import FORMATS, get_format  # noqa: E402
+from novel.formats import DEFAULT_FORMAT, FORMATS, get_format, resolve_format  # noqa: E402
 from novel.models import ModelRegistry, preset_for, SEARCH_ROOTS  # noqa: E402
 from novel.presets import WORLD_PRESETS, get_preset, list_presets  # noqa: E402
 from novel.protocol import parse_reply  # noqa: E402
@@ -252,14 +252,139 @@ def test_prompts() -> None:
 
 
 def test_formats() -> None:
-    """Форматы диалога согласованы между собой."""
-    print("\nФорматы диалога:")
-    check("форматов пять", len(FORMATS) == 5, str(list(FORMATS)))
-    check("есть формат с фотографиями", get_format("chat_photo").scene_role == "photo")
-    check("чат без картинок", not get_format("chat").wants_scene)
-    check("неизвестный ключ даёт формат по умолчанию", get_format("нет").key == "story")
+    """Типы повествования согласованы между собой."""
+    print("\nТипы повествования:")
+    from novel.prompts import base_instruction
+    check("типов три", len(FORMATS) == 3, str(list(FORMATS)))
+    check("типы называются как надо", set(FORMATS) == {"story", "chat", "quest"},
+          str(sorted(FORMATS)))
+    check("у чата кадр — снимок от собеседника",
+          get_format("chat").scene_role == "photo", get_format("chat").scene_role)
+    check("у истории и квеста кадр — иллюстрация",
+          get_format("story").scene_role == "illustration"
+          and get_format("quest").scene_role == "illustration")
+    check("неизвестный ключ даёт тип по умолчанию", get_format("нет").key == DEFAULT_FORMAT)
     check("у всех есть инструкция", all(f.prose_style.strip() for f in FORMATS.values()))
-    check("у всех есть политика картинок", all(f.default_image_policy for f in FORMATS.values()))
+    check("у всех есть подпись поля ввода", all(f.user_label.strip() for f in FORMATS.values()))
+
+    # Прежние ключи различались только настройками картинок и переведены в нынешние.
+    check("прежний story_terse ведёт в story", get_format("story_terse").key == "story")
+    check("прежний chat_photo ведёт в chat", get_format("chat_photo").key == "chat")
+    check("прежний chat_scene ведёт в chat", get_format("chat_scene").key == "chat")
+    check("прежние ключи не остались в списке",
+          not (set(FORMATS) & {"story_terse", "chat_photo", "chat_scene"}))
+
+    # Кадры выключаются политикой, а не типом: при «никогда» блока сцены нет
+    # ни в одном типе, иначе ведущий опишет кадр и он всё равно нарисуется.
+    for key in ("story", "chat", "quest"):
+        for portrait in (True, False):
+            text = base_instruction(get_format(key), "never", portrait)
+            check(f"при «никогда» нет блока сцены: {key}, "
+                  f"{'персонаж' if portrait else 'сцена'}", "<scene>" not in text)
+    check("при других политиках блок сцены есть",
+          "<scene>" in base_instruction(get_format("chat"), "manual", True))
+
+    # Рамку задают настройки, а что в ней — решает ведущий. Инструкция обязана
+    # сказать это прямо, иначе он либо не ставит блок, либо повторяет карточку.
+    from novel.prompts import scene_reminder
+    for key, portrait in (("chat", True), ("story", False), ("quest", False)):
+        text = base_instruction(get_format(key), "manual", portrait)
+        check(f"рамка от настроек названа в типе {key}",
+              "Рамка задана настройкой" in text, text[:80])
+        check(f"выбор вида отдан ведущему в типе {key}",
+              "решаешь ты" in text, text[:80])
+
+    # Напоминание о кадре идёт в конец промпта: в начале ведущий его не видит.
+    note = scene_reminder(get_format("story"), "portrait")
+    check("напоминание о кадре просит блок", "<scene>" in note, note[:80])
+    check("напоминание о кадре говорит про глаза игрока",
+          "с глаз игрока" in note, note[:80])
+    check("напоминание просит новый момент",
+          "не то же, что в прошлом кадре" in note, note[:80])
+    check("для сцены напоминание другое",
+          "общий план" in scene_reminder(get_format("story"), "scene"))
+    check("у типа без кадров напоминания нет",
+          scene_reminder(get_format("story"), "portrait") != "")
+
+    # Формат принадлежит партии, а не миру: один мир проходят и прозой, и
+    # перепиской. Пустое значение у партии означает «как у мира».
+    check("тип партии важнее типа мира",
+          resolve_format("chat", "story").key == "chat",
+          resolve_format("chat", "story").key)
+    check("пустой тип партии берёт тип мира",
+          resolve_format("", "chat").key == "chat",
+          resolve_format("", "chat").key)
+    check("оба пустые дают тип по умолчанию",
+          resolve_format("", "").key == DEFAULT_FORMAT, resolve_format("", "").key)
+    check("незнакомый тип партии падает на тип мира",
+          resolve_format("чепуха", "chat").key == "chat",
+          resolve_format("чепуха", "chat").key)
+    check("прежний тип у партии понимается",
+          resolve_format("chat_photo", "story").key == "chat",
+          resolve_format("chat_photo", "story").key)
+
+    # Под каждый тип обязан быть шаблон: иначе тип есть, а начать с него нечего.
+    from novel.presets import WORLD_PRESETS
+    from novel.quests import QUEST_PRESETS
+
+    covered: dict[str, list[str]] = {}
+    for preset in WORLD_PRESETS:
+        covered.setdefault(preset.get("format") or "story", []).append(preset["key"])
+    for item in QUEST_PRESETS:
+        covered.setdefault(item.get("format") or "quest", []).append(item["key"])
+    for key in FORMATS:
+        check(f"под тип {key} есть шаблон", bool(covered.get(key)),
+              f"шаблонов: {len(covered.get(key, []))}")
+
+    # У чатовых заготовок повествование не должно требовать прозы: иначе слой
+    # мира спорит со слоем типа, и ведущий пишет абзацы вместо строк переписки.
+    for preset in WORLD_PRESETS:
+        if preset.get("format") != "chat":
+            continue
+        narrator = str(preset.get("narrator") or "").lower()
+        check(f"у чатовой заготовки {preset['key']} повествование не просит прозы",
+              "второе лицо" not in narrator, narrator)
+        check(f"у чатовой заготовки {preset['key']} один собеседник",
+              len(preset["characters"]) == 1, str(len(preset["characters"])))
+        check(f"у чатовой заготовки {preset['key']} видны кадры",
+              bool(preset.get("image_policy")) and bool(preset.get("image_frame")))
+
+
+def test_session_format() -> None:
+    """Формат партии хранится и переживает перезапуск."""
+    print("\nФормат партии:")
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = Path(tmp) / "fmt.db"
+        db = NovelDB(path)
+        try:
+            world = db.create_world(name="Проба", format="story")
+            plain = db.create_session(world, "Как у мира")
+            own = db.create_session(world, "Переписка", format="chat")
+
+            check("новая партия без формата наследует мир",
+                  db.session(plain).format == "", repr(db.session(plain).format))
+            check("новая партия с форматом хранит его",
+                  db.session(own).format == "chat", repr(db.session(own).format))
+
+            db.set_session_format(own, "chat_photo")
+            check("формат партии меняется",
+                  db.session(own).format == "chat_photo", repr(db.session(own).format))
+
+            db.set_session_format(own, "")
+            check("партию можно вернуть к формату мира",
+                  db.session(own).format == "", repr(db.session(own).format))
+        finally:
+            db.close()
+
+        # Колонка должна переживать повторное открытие базы.
+        again = NovelDB(path)
+        try:
+            check("формат переживает перезапуск", again.session(own).format == "")
+            check("столбец формата на месте",
+                  "format" in [row["name"] for row in
+                               again.conn.execute("PRAGMA table_info(sessions)")])
+        finally:
+            again.close()
 
 
 def test_context() -> None:
@@ -415,6 +540,33 @@ def test_reasoning_kwargs() -> None:
     client.reasoning_kwargs = None
     untouched = client._with_reasoning({"messages": []})
     check("без настройки тело не меняется", "chat_template_kwargs" not in untouched)
+
+    # Движок отдаёт готовый набор полей, и класть их надо по-разному: от этого
+    # зависит, выключились размышления или нет. У Qwen они задаются шаблоном
+    # чата, у gpt-oss и чужих серверов — полем верхнего уровня.
+    client.reasoning_kwargs = {"enable_thinking": False, "thinking_mode": "disabled"}
+    template = client._with_reasoning({"messages": []})
+    check("шаблонное поле уходит внутрь chat_template_kwargs",
+          template["chat_template_kwargs"]["enable_thinking"] is False,
+          str(template))
+    check("и второе шаблонное поле тоже",
+          template["chat_template_kwargs"]["thinking_mode"] == "disabled", str(template))
+    check("шаблонное поле не остаётся наверху", "enable_thinking" not in template,
+          str(template))
+
+    client.reasoning_kwargs = {"reasoning_effort": "low"}
+    effort = client._with_reasoning({"messages": []})
+    check("reasoning_effort уходит полем верхнего уровня",
+          effort.get("reasoning_effort") == "low", str(effort))
+    check("reasoning_effort не попадает в шаблон",
+          "chat_template_kwargs" not in effort, str(effort))
+
+    client.reasoning_kwargs = {"enable_thinking": False, "reasoning_effort": "low"}
+    both = client._with_reasoning({"chat_template_kwargs": {"custom": 1}})
+    check("оба вида раскладываются каждый на своё место",
+          both.get("reasoning_effort") == "low"
+          and both["chat_template_kwargs"].get("enable_thinking") is False
+          and both["chat_template_kwargs"].get("custom") == 1, str(both))
 
     settings = Settings()
     check("размышления по умолчанию выключены", settings.reasoning_mode == "off")
@@ -2045,30 +2197,30 @@ def test_image_control() -> None:
             check("без аргумента — текущая ступень",
                   Settings().image_dimensions() == (768, 20))
 
-            # Портрет в переписке.
-            chat = base_instruction(get_format("chat_photo"), "minimal", True)
-            check("в переписке рисуется портрет", "Портрет собеседника" in chat)
-            check("портрет в полный рост",
-                  "в полный рост" in chat and "full body shot" in chat, chat[-700:])
-            check("лицо крупно запрещено", "Лицо крупно не давай" in chat)
+            # Кадр крупным планом: собеседник, вид из глаз игрока.
+            chat = base_instruction(get_format("chat"), "minimal", True)
+            check("в переписке рисуется собеседник", "снят с глаз игрока" in chat, chat[:120])
+            check("кадр берётся с глаз игрока",
+                  "first person view" in chat and "самого игрока в кадре нет" in chat,
+                  chat[-700:])
             check("сказано брать внешность из карточки",
                   "из карточки персонажа дословно" in chat)
-            check("портрет требует одного собеседника", "РОВНО ОДНОГО" in chat)
-            scene_mode = base_instruction(get_format("chat_photo"), "minimal", False)
-            check("можно вернуть сцену", "Портрет собеседника" not in scene_mode)
+            check("крупный план требует одного собеседника", "РОВНО ОДНОГО" in chat)
+            scene_mode = base_instruction(get_format("chat"), "minimal", False)
+            check("можно вернуть сцену", "снят с глаз игрока" not in scene_mode, scene_mode[:120])
 
-            # Затвор портрета: он включается только в переписке и только по
-            # настройке. В прозе кадр остаётся сценой, что бы ни стояло в поле.
+            # Крупный план действует во всех типах повествования: прежде он
+            # молча не работал в истории и квесте, и переключатель ничего не менял.
             settings.chat_frame = "portrait"
             builder = ContextBuilder(db, object(), lambda: settings)
-            check("в переписке портрет включается",
-                  builder._portrait_mode(get_format("chat_photo")))
-            check("в диалогах с картинками тоже",
-                  builder._portrait_mode(get_format("chat_scene")))
-            check("в прозе портрет не включается",
-                  not builder._portrait_mode(get_format("story")))
-            check("в формате без картинок не включается",
-                  not builder._portrait_mode(get_format("chat")))
+            for key in ("story", "chat", "quest"):
+                check(f"крупный план включается в типе {key}",
+                      builder._portrait_mode(get_format(key)), key)
+            settings.chat_frame = "scene"
+            for key in ("story", "chat", "quest"):
+                check(f"общий план включается в типе {key}",
+                      not builder._portrait_mode(get_format(key)), key)
+            settings.chat_frame = "portrait"
             settings.chat_frame = "scene"
             check("настройка «сцену целиком» выключает портрет",
                   not builder._portrait_mode(get_format("chat_photo")))
@@ -2130,7 +2282,13 @@ def test_schema_rebuild() -> None:
                 " image_suffix TEXT NOT NULL DEFAULT '',"
                 " created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)"
             )
-            db.conn.execute("INSERT INTO worlds SELECT * FROM worlds_legacy")
+            # Столбцы перечисляются явно: у нынешней таблицы их больше, чем у
+            # старой, и звёздочка переносила бы лишние значения.
+            db.conn.execute(
+                "INSERT INTO worlds (id, name, format, brief, genre, tone, style,"
+                " narrator, hidden_rules, image_suffix, created_at, updated_at)"
+                " SELECT id, name, format, brief, genre, tone, style, narrator,"
+                " hidden_rules, image_suffix, created_at, updated_at FROM worlds_legacy")
             db.conn.execute("DROP TABLE worlds_legacy")
             db.conn.commit()
             hurt = db.conn.execute(
@@ -2309,8 +2467,8 @@ def test_chat_format() -> None:
     prose_reminder = prompts.style_reminder(get_format("story"))
     check("у прозы своё напоминание", "проз" in prose_reminder.lower())
     check("проза не получает чатового образца", "Марта:" not in prose_reminder)
-    check("у сжатой истории своё напоминание",
-          "действия и реплики" in prompts.style_reminder(get_format("story_terse")))
+    check("у квеста напоминание как у прозы",
+          "проза" in prompts.style_reminder(get_format("quest")).lower())
 
 
 def test_image_policies() -> None:
@@ -2648,7 +2806,7 @@ def test_portrait_subject() -> None:
             store = SettingsStore(Path(tmp) / "s.json")
             machine = NovelMachine(db, store, ModelRegistry())
 
-            check("формат партии прочитан", machine._format_for(session_id).key == "chat_photo")
+            check("тип партии прочитан", machine._format_for(session_id).key == "chat")
             check("стиль мира прочитан",
                   machine._world_style(session_id) == "cinematic lighting")
             check("режим портрета включён",
@@ -2668,14 +2826,24 @@ def test_portrait_subject() -> None:
             check("чужое имя не подставляется", subject([], "стражник: стоять") is None)
             check("без реплик никого не назначаем", subject([], "просто текст") is None)
 
-            # Промпт пересобирается, только если это не полный рост.
+            # Описание ведущего сохраняется, внешность дописывается к нему.
+            # Прежде описание выбрасывалось и кадр собирался из карточки — оттого
+            # правка описания и перерисовка ничего не меняли.
             character = db.characters(world_id)[0]
             shaped = machine._shape_portrait("POV shot from a seat", character, "cinematic lighting")
-            check("чужой кадр пересобран в портрет",
-                  shaped.startswith("full body shot of a stout woman"), shaped)
+            check("описание ведущего сохранено",
+                  shaped.startswith("POV shot from a seat"), shaped)
+            check("внешность дописана к описанию",
+                  "a stout woman with a scarred face" in shaped, shaped)
             check("стиль мира дописан", "cinematic lighting" in shaped, shaped)
-            untouched = machine._shape_portrait("full body shot of someone", character, "x")
-            check("готовый полный рост не трогаем", untouched == "full body shot of someone")
+
+            # Повтор внешности не раздувает промпт: карточку ведущему велено
+            # брать дословно, поэтому она обычно уже в описании.
+            twice = machine._shape_portrait(
+                "a stout woman with a scarred face raises a mug", character, "x")
+            check("внешность не повторяется дважды",
+                  twice.lower().count("scarred face") == 1, twice)
+
             # Русскую внешность подставлять нельзя: генератор понимает только
             # английский, и в промпт попадало «full body shot of цифровой образ».
             russian = Character(id=8, world_id=world_id, name="Селена", role="",
@@ -2690,17 +2858,22 @@ def test_portrait_subject() -> None:
             check("русский стиль тоже не дописывается",
                   "русский стиль" not in machine._shape_portrait(
                       "POV", russian, "русский стиль"))
-            # Без внешности промпт не выбрасывается: он уже на английском, его
-            # достаточно пометить полным ростом.
-            check("без внешности промпт помечается полным ростом",
-                  machine._shape_portrait("POV", Character(
-                      id=9, world_id=world_id, name="Пустой", role="", description="",
-                      appearance="", speech="", enabled=True, created_at=0), "x")
-                  == "full body shot, POV")
+
+            # Без внешности остаётся одно описание ведущего.
+            bare = Character(id=9, world_id=world_id, name="Пустой", role="",
+                             description="", appearance="", speech="",
+                             enabled=True, created_at=0)
+            check("без внешности остаётся описание ведущего со стилем",
+                  machine._shape_portrait("POV", bare, "x") == "POV, x",
+                  machine._shape_portrait("POV", bare, "x"))
             check("совсем без промпта пусто",
-                  machine._shape_portrait("", Character(
-                      id=9, world_id=world_id, name="Пустой", role="", description="",
-                      appearance="", speech="", enabled=True, created_at=0), "x") == "")
+                  machine._shape_portrait("", bare, "x") == "")
+
+            # Главное: правка описания меняет промпт кадра. Иначе перерисовка
+            # выдаёт ту же картинку, что и была.
+            check("правка описания меняет промпт кадра",
+                  machine._shape_portrait("POV, hand reaching out", character, "x")
+                  != machine._shape_portrait("POV, sitting by a fire", character, "x"))
             check("целостность чистая", db.check_integrity() == [])
         finally:
             db.close()
@@ -3211,7 +3384,321 @@ def _ContextBuilderForTest(db):  # noqa: N802 — зовётся как конс
     return ContextBuilder(db, object(), lambda: Settings(), lambda *a: [])
 
 
+def test_quest() -> None:
+    """Режим квеста: переходы, вещи, этапы и исход."""
+    print("\nКвест:")
+    from novel import quest as quest_mod
+
+    definition: dict = {
+        "key": "probe",
+        "title": "Проба",
+        "goal": "выйти",
+        "fail": "остаться",
+        "start": "atrium",
+        "locations": [
+            {"id": "atrium", "name": "Атриум", "exits": ["corridor"]},
+            {"id": "corridor", "name": "Коридор", "exits": ["atrium", "server"]},
+            {"id": "server", "name": "Серверная", "exits": ["corridor"]},
+        ],
+        "items": [
+            {"id": "clip", "name": "Скрепка", "where": ""},
+            {"id": "card", "name": "Ключ-карта", "where": "server"},
+        ],
+        "stages": [
+            {"id": "s1", "title": "Первый", "goal": "выйти из атриума", "events": [], "reveal": ""},
+            {"id": "s2", "title": "Второй", "goal": "дойти до серверной", "events": [], "reveal": ""},
+            {"id": "s3", "title": "Третий", "goal": "открыть дверь", "events": [], "reveal": ""},
+        ],
+        "characters": [],
+    }
+
+    class FakeDB:
+        """Хранилище состояния в памяти: база здесь ни к чему."""
+
+        def __init__(self) -> None:
+            self.data: dict = {}
+
+        def get_state(self, session_id: int, key: str, default: object = None) -> object:
+            return self.data.get((session_id, key), default)
+
+        def set_state(self, session_id: int, key: str, value: object) -> None:
+            self.data[(session_id, key)] = value
+
+    db = FakeDB()
+    state = quest_mod.initial_state(definition)
+    check("квест: предмет без места сразу у игрока", state["carried"] == ["clip"],
+          str(state["carried"]))
+    check("квест: игрок на старте", state["location"] == "atrium", state["location"])
+
+    def apply(report: dict) -> dict:
+        """Применяет отчёт к общему состоянию пробы."""
+        return quest_mod.apply_report(db, 1, definition, report)
+
+    result = apply({"location": "server"})
+    check("квест: переход в несоседнюю локацию отклонён",
+          not result["applied"] and bool(result["rejected"]), str(result))
+
+    result = apply({"location": "corridor"})
+    check("квест: переход в соседнюю принят",
+          result["state"]["location"] == "corridor", str(result))
+
+    result = apply({"take": ["card"]})
+    check("квест: взять предмет из другой локации нельзя",
+          not result["applied"] and bool(result["rejected"]), str(result))
+
+    result = apply({"location": "server", "take": ["card"]})
+    check("квест: на месте предмет берётся",
+          "card" in result["state"]["carried"], str(result))
+
+    result = apply({"take": ["card"]})
+    check("квест: повторно предмет не берётся",
+          not result["applied"] and bool(result["rejected"]), str(result))
+
+    result = apply({"use": ["clip"]})
+    check("квест: применение предмета из рук принято",
+          "clip" in result["state"]["used"] and "clip" not in result["state"]["carried"],
+          str(result))
+
+    result = apply({"use": ["nonexistent"]})
+    check("квест: применить несуществующее нельзя",
+          not result["applied"] and bool(result["rejected"]), str(result))
+
+    result = apply({"stage": 2})
+    check("квест: через этап не перескочить",
+          not result["applied"] and bool(result["rejected"]), str(result))
+
+    result = apply({"stage": 1})
+    check("квест: этап без улики не двигается",
+          not result["applied"] and bool(result["rejected"]), str(result))
+
+    # Улика — любое другое изменение в том же отчёте.
+    result = apply({"location": "server", "use": ["card"], "stage": 1})
+    check("квест: этап с уликой двигается", result["state"]["stage"] == 1, str(result))
+
+    # Ведущий пишет то код места, то название: принимается и то, и другое.
+    result = apply({"location": "Коридор"})
+    check("квест: место принимается по названию",
+          result["state"]["location"] == "corridor", str(result))
+
+    result = apply({"end": "win"})
+    check("квест: победа записывается",
+          quest_mod.outcome(result["state"]) == "win", str(result))
+
+    result = apply({"location": "atrium"})
+    check("квест: после конца ничего не меняется",
+          not result["applied"], str(result))
+
+    # Слой обязан сказать ведущему, что здесь можно найти: без этого он выдумывал
+    # находку в тексте, но заявить её не мог, и квест стоял на месте.
+    fresh = quest_mod.initial_state(definition)
+    fresh["location"] = "server"
+    layer_here = prompts.quest_block(definition, fresh)
+    check("квест: слой называет находку этого места",
+          "Ключ-карта" in layer_here, layer_here[:200])
+    check("квест: слой требует заявить находку", "полем take" in layer_here)
+    fresh["location"] = "atrium"
+    check("квест: в пустом месте сказано, что искать нечего",
+          "искать нечего" in prompts.quest_block(definition, fresh))
+
+    parsed = parse_reply('<prose>текст</prose><quest>{"stage": 1}</quest>')
+    check("квест: блок разобран", parsed.quest.get("stage") == 1, str(parsed.quest))
+    parsed = parse_reply("<prose>текст</prose><quest>не json</quest>")
+    check("квест: мусор в блоке не ломает разбор",
+          parsed.quest == {} and bool(parsed.errors), str(parsed.errors))
+
+    check("квест: пустой блок разбирается в пустое", quest_mod.parse_report("") == {})
+    check("квест: отчёт не объект даёт пустое", quest_mod.parse_report("[1,2]") == {})
+
+    layer = prompts.quest_block(definition, state)
+    check("квест: слой промпта не пуст", bool(layer.strip()))
+    check("квест: слой называет текущее место",
+          "Атриум" in layer or "Серверная" in layer)
+
+    won = prompts.quest_block(definition, dict(state, status="win"))
+    check("квест: после победы слой говорит об окончании", "ОКОНЧЕН" in won, won[:80])
+
+    # Ведущий называет место по-своему: «ресепшен» там, где в квесте «Ресепшн».
+    # Сверка идёт по началу слова, иначе состояние застывает на старте.
+    for written in ("Атриум", "атриуме", "АТРИУМ"):
+        found = quest_mod.match_location(definition, written)
+        check(f"квест: место узнаётся по «{written}»",
+              bool(found) and found["id"] == "atrium", str(found))
+    check("квест: выдуманное место не узнаётся",
+          quest_mod.match_location(definition, "выдуманный зал") is None)
+    check("квест: короткое слово не совпадает",
+          quest_mod.match_location(definition, "за") is None)
+
+    state = quest_mod.initial_state(definition)
+    moved = quest_mod.sync_location(db, 2, definition, state, "в коридоре")
+    check("квест: место двигает состояние", moved["changed"], str(moved))
+    check("квест: состояние осталось на новом месте",
+          moved["state"]["location"] == "corridor", moved["state"]["location"])
+
+    # Из серверной выход только в коридор, а в атриум — нет.
+    deep = dict(moved["state"], location="server")
+    still = quest_mod.sync_location(db, 2, definition, deep, "в атриуме")
+    check("квест: недостижимое место состояние не двигает",
+          not still["changed"], str(still))
+
+    finished = quest_mod.initial_state(definition)
+    finished["status"] = "win"
+    after = quest_mod.sync_location(db, 3, definition, finished, "Коридор")
+    check("квест: после конца место не двигается", not after["changed"], str(after))
+
+
+def test_turn_and_status() -> None:
+    """Полный ход и снимок состояния: то, что не проверялось вовсе.
+
+    Снимок зовёт подпись состояния, и если та обратится к снимку, выйдет
+    бесконечная рекурсия. Проявится она на каждом запросе состояния — то есть
+    приложение просто перестанет отвечать. Ловится только вызовом.
+    """
+    print("\nПолный ход и состояние:")
+    from novel.machine import NovelMachine
+    from novel.models import ModelRegistry
+    from novel.settings import SettingsStore
+
+    class FakeEngine:
+        """Движок отвечает заранее заготовленным текстом."""
+
+        def __init__(self) -> None:
+            self.reasoning_kwargs = None
+
+        def configure_reasoning(self, mode):
+            """Настройка размышлений: считается применённой."""
+            return {"applied": True, "mode": mode, "model_default": "off"}
+
+        def stats(self):
+            """Сведения о движке для снимка состояния."""
+            return {"vram_bytes": 9_000_000_000, "model": {"id": "проба", "ctx": 8192},
+                    "throughput": {"decode_tps": 0.0}}
+
+        def geometry(self):
+            """Геометрия кэша: снимку нужен только текст."""
+            return type("G", (), {"describe": lambda self: "проба"})()
+
+        def supports_images(self):
+            """Картинки движок не принимает."""
+            return False
+
+        def chat(self, messages, **kwargs):
+            """Короткий ответ на служебный вопрос."""
+            from novel.freetoken import ChatResult
+
+            return ChatResult(text="", elapsed_s=0.1, prompt_tokens=1,
+                              completion_tokens=1, raw={})
+
+        def chat_stream(self, messages, **kwargs):
+            """Ответ на ход: текст с блоком сцены."""
+            from novel.freetoken import ChatResult
+
+            return ChatResult(
+                text=(
+                    "<prose>Ты входишь в зал, и двери закрываются за спиной.</prose>\n"
+                    '<scene>{"location":"Зал","npc":[],'
+                    '"image_prompt":"a dim hall with tall windows",'
+                    '"style":"oil painting"}</scene>'
+                ),
+                elapsed_s=1.0,
+                prompt_tokens=100,
+                completion_tokens=50,
+                ttft_s=0.5,
+                raw={},
+            )
+
+    class FakeController:
+        """Порт занят нашим движком: запускать ничего не нужно."""
+
+        port = 1919
+
+        def port_pid(self):
+            """Номер процесса на порту."""
+            return 4242
+
+        def is_healthy(self):
+            """Движок отвечает."""
+            return True
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        db = NovelDB(Path(tmp) / "turn.db")
+        try:
+            world_id = db.create_world(name="Проба хода", format="story",
+                                       brief="зал с высокими окнами")
+            session_id = db.create_session(world_id, "Партия")
+            store = SettingsStore(Path(tmp) / "s.json")
+            store.load()
+            # Служебные обращения к движку выключаются: проверяется ход, а не они.
+            store.settings.looks_tracking = False
+            store.settings.summarize_enabled = False
+            store.settings.image_policy = "manual"
+
+            machine = NovelMachine(db, store, ModelRegistry())
+            machine.ft = FakeEngine()
+            machine.controller = FakeController()
+
+            # Снимок состояния: если подпись зовёт снимок, здесь будет рекурсия.
+            snapshot = machine.status()
+            check("снимок состояния собирается", isinstance(snapshot, dict),
+                  type(snapshot).__name__)
+            check("в снимке есть фаза", "state" in snapshot, str(list(snapshot))[:80])
+            check("подпись состояния читается",
+                  bool((snapshot.get("now") or {}).get("detail")),
+                  str(snapshot.get("now"))[:80])
+
+            outcome = machine._llm_turn(session_id, "Захожу внутрь.", "", [])
+            check("ход прошёл", outcome is not None)
+            check("текст записан",
+                  "двери закрываются" in db.messages(session_id)[-1].content,
+                  db.messages(session_id)[-1].content[:80])
+            check("сцена заведена", len(outcome.scene_ids) == 1, str(outcome.scene_ids))
+
+            # И снимок после хода: состояние сменилось, подпись обязана собраться.
+            after = machine.status()
+            check("снимок собирается и после хода",
+                  bool((after.get("now") or {}).get("detail")))
+            check("целостность чистая", db.check_integrity() == [])
+        finally:
+            db.close()
+
+
+def test_strip_machine_tags() -> None:
+    """Машинные блоки не попадают в текст для игрока.
+
+    Наблюдался случай, когда в историю партии лёг сырой ответ вместе с блоком
+    сцены: 2217 знаков вместо 1750. Очистка перед записью делает такую утечку
+    невозможной, независимо от того, почему разбор не отделил блок.
+    """
+    print("\nОчистка текста перед записью:")
+    from novel.protocol import strip_machine_tags
+
+    raw = (
+        "Ты выходишь на улицу под дождь. Неон отражается в лужах.\n\n"
+        '<scene>\n{\n  "location": "Улица",\n  "npc": [],\n'
+        '  "image_prompt": "a rainy neon street",\n  "style": "cyberpunk"\n}\n</scene>'
+    )
+    cleaned, removed = strip_machine_tags(raw)
+    check("блок сцены вырезан", removed == ["scene"], str(removed))
+    check("тег не остался", "<scene" not in cleaned, cleaned[-60:])
+    check("проза сохранена", "Неон отражается" in cleaned, cleaned[:60])
+    check("текст стал короче", len(cleaned) < len(raw),
+          f"{len(cleaned)} против {len(raw)}")
+
+    plain = "Ты входишь в зал, и двери закрываются за спиной."
+    same, nothing = strip_machine_tags(plain)
+    check("обычный текст не тронут", same == plain and not nothing, same[:50])
+
+    # Несколько блоков сразу: вырезаются все.
+    many = ('Проза.\n<scene>{"location": "A"}</scene>\n'
+            '<looks>{"герой": "в плаще"}</looks>')
+    clean_many, names = strip_machine_tags(many)
+    check("вырезаны все блоки", sorted(names) == ["looks", "scene"], str(names))
+    check("от нескольких блоков осталась проза", clean_many.strip() == "Проза.",
+          clean_many)
+
+
 def main() -> int:
+
+
     setup_console()
     print("=== Самотест NovelForge ===")
     test_protocol()
@@ -3219,6 +3706,7 @@ def main() -> int:
     test_settings()
     test_prompts()
     test_formats()
+    test_session_format()
     test_context()
     test_summarization()
     test_reasoning_kwargs()
@@ -3267,6 +3755,9 @@ def main() -> int:
     test_persona_reminder()
     test_prompts_have_no_undefined_calls()
     test_presets_and_models()
+    test_quest()
+    test_turn_and_status()
+    test_strip_machine_tags()
     print(f"\nПройдено: {PASSED}, провалено: {FAILED}\n")
     return 1 if FAILED else 0
 

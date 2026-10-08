@@ -102,6 +102,68 @@ class KillReport:
         }
 
 
+#: Номера процессов движка, погашенных за время работы приложения. Нужны,
+#: чтобы находить рабочих, чей родитель умер раньше: сами они дерева не знают.
+_KILLED_ENGINE_PIDS: set[int] = set()
+
+
+def _declared_parent(proc: "psutil.Process") -> int | None:
+    """Родитель, объявленный рабочим процессом в своей командной строке.
+
+    Рабочие FreeToken запускаются через ``multiprocessing.spawn`` и объявляют
+    родителя как ``spawn_main(parent_pid=N)``. Слова FreeToken в их командной
+    строке нет, поэтому по имени их не найти.
+
+    @param proc: процесс для осмотра.
+    @returns: номер объявленного родителя; None, если его нет.
+    """
+    try:
+        cmdline = " ".join(proc.cmdline())
+    except psutil.Error:
+        return None
+    marker = "spawn_main(parent_pid="
+    at = cmdline.find(marker)
+    if at < 0:
+        return None
+    digits = ""
+    for char in cmdline[at + len(marker):]:
+        if char.isdigit():
+            digits += char
+        else:
+            break
+    return int(digits) if digits else None
+
+
+def _sweep_workers(parent_pids: set[int]) -> list[int]:
+    """Гасит рабочих, чей родитель входит в переданный набор.
+
+    Набор собирается только из процессов движка: иначе под метлу попадут чужие
+    приложения на Python, у которых тоже есть ``multiprocessing.spawn``.
+
+    @param parent_pids: номера процессов движка, живых или только что погашенных.
+    @returns: номера погашенных рабочих.
+    """
+    if not parent_pids:
+        return []
+    doomed = []
+    for proc in psutil.process_iter(["pid"]):
+        try:
+            if proc.info["pid"] in parent_pids:
+                continue
+        except psutil.Error:
+            continue
+        if _declared_parent(proc) in parent_pids:
+            doomed.append(proc)
+    swept: list[int] = []
+    for proc in doomed:
+        try:
+            proc.kill()
+            swept.append(proc.pid)
+        except psutil.Error:
+            continue
+    return swept
+
+
 def engine_pids() -> list[int]:
     """PID-ы процессов движка FreeToken вместе с воркерами."""
     found: list[int] = []
@@ -122,7 +184,40 @@ def engine_pids() -> list[int]:
             found.extend(child.pid for child in psutil.Process(proc.info["pid"]).children(recursive=True))
         except psutil.Error:
             continue
+    # Рабочие по имени не находятся: слова FreeToken в их командной строке нет.
+    # Они опознаются по объявленному родителю — живому или недавно погашенному.
+    known = set(found) | _KILLED_ENGINE_PIDS
+    if known:
+        for proc in psutil.process_iter(["pid"]):
+            try:
+                if proc.info["pid"] in known:
+                    continue
+            except psutil.Error:
+                continue
+            if _declared_parent(proc) in known:
+                found.append(proc.info["pid"])
     return sorted(set(found))
+
+
+def stop_engine_processes(timeout_s: float = 20.0) -> dict[str, Any]:
+    """Гасит процессы движка FreeToken, освобождая видеопамять.
+
+    Нужна при смене движка: контроллер к этому моменту уже смотрит на новый
+    движок, и прежний процесс иначе остаётся держать карту — FreeToken и
+    llama.cpp делят один порт, но это разные процессы.
+
+    @param timeout_s: сколько ждать штатного завершения.
+    @returns: отчёт с числом остановленных процессов и временем.
+    """
+    pids = engine_pids()
+    if not pids:
+        return {"stopped": 0, "seconds": 0.0}
+    seconds = _terminate_tree(pids, timeout_s)
+    # Родитель погашен, но рабочие могли не успеть за ним. Их находят не по
+    # имени, а по объявленному родителю: без метлы они держат память.
+    _KILLED_ENGINE_PIDS.update(pids)
+    swept = _sweep_workers(set(pids))
+    return {"stopped": len(pids), "swept": len(swept), "seconds": round(seconds, 2)}
 
 
 def _terminate_tree(pids: list[int], timeout_s: float = 20.0) -> float:
@@ -193,6 +288,11 @@ def kill_everything(stop_comfy: bool = True, timeout_s: float = 20.0) -> KillRep
 
     engine = engine_pids()
     engine_seconds = _terminate_tree(engine, timeout_s) if engine else 0.0
+    # Те же рабочие, что и в обычной остановке: без метлы они остаются держать
+    # память, а найти их штатным поиском нельзя.
+    if engine:
+        _KILLED_ENGINE_PIDS.update(engine)
+        _sweep_workers(set(engine))
 
     comfy: list[int] = []
     comfy_seconds = 0.0

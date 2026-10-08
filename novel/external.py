@@ -1,14 +1,14 @@
 """Внешний движок: llama.cpp вместо FreeToken.
 
-FreeToken не грузит GGUF, а на диске лежат десятки таких моделей. Рядом оказались
-сборки llama.cpp — их кладёт LM Studio, — и они говорят на том же протоколе
-``/v1/chat/completions``, что и FreeToken. Поэтому второй движок не требует
-отдельного клиента: меняются адрес, имя модели и способ запуска.
+FreeToken не грузит GGUF, а на диске лежат десятки таких моделей. Сборки llama.cpp
+кладут рядом LM Studio, и они говорят на том же протоколе ``/v1/chat/completions``,
+что и FreeToken. Поэтому второй движок не требует отдельного клиента: меняются
+адрес, имя модели и способ запуска.
 
-Сборку приходится выбирать осторожно. У процессора Intel Core Ultra (Arrow Lake)
-нет AVX-512, и сборка с ним падает с кодом ``0xC000001D`` — «недопустимая
-инструкция». Поэтому кандидат не просто ищется по имени, а проверяется запуском
-``--version``: молчащая сборка не годится, даже если файл на месте.
+Сборку нужно выбирать осторожно. Сборка с AVX-512 на процессоре без него падает с
+кодом ``0xC000001D`` — «недопустимая инструкция». Поэтому кандидат не просто
+ищется по имени, а проверяется запуском ``--version``: молчащая сборка не годится,
+даже если файл на месте.
 
 Модуль управляет только локальным llama.cpp. LM Studio поднимает свой сервер сам,
 и для него нужен лишь адрес — см. :func:`is_external_url_alive`.
@@ -34,12 +34,12 @@ _CREATE_FLAGS = (
     subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
 )
 
-#: Каталоги LM Studio со сборками llama.cpp. Версии Vulkan проверены на живом
-#: запуске; сборки с AVX-512 молчат, поэтому проверяются, а не берутся на веру.
+#: Каталоги LM Studio со сборками llama.cpp. Сборки с AVX-512 на процессоре без
+#: него молчат при запуске, поэтому сборка не угадывается по имени, а проверяется.
 LMSTUDIO_BACKENDS = Path.home() / ".lmstudio" / "extensions" / "backends"
 
 #: Сборки, которые стоит пробовать, в порядке предпочтения. Vulkan первым: он
-#: использует видеокарту, а CUDA-сборки LM Studio оказались нерабочими.
+#: использует видеокарту, а CUDA-сборки LM Studio не запускаются.
 BACKEND_PATTERNS = (
     "llama.cpp-win-x86_64-vulkan-avx2-*",
     "llama.cpp-win-x86_64-avx2-*",
@@ -48,13 +48,27 @@ BACKEND_PATTERNS = (
 #: Отдельные сборки вне LM Studio. Идут **последними**: проверка ``--version``
 #: их пропускает, а падают они позже — при загрузке модели. Сборка с AVX-512 на
 #: процессорах без него валится с ``0xC000001D`` уже на подборе памяти. Поэтому
-#: сначала идут сборки, проверенные живой загрузкой. Свои пути задаются
-#: переменной окружения ``NOVELFORGE_LLAMACPP_SERVERS`` через запятую.
+#: сначала идут сборки LM Studio. Свои пути задаются переменной окружения
+#: ``NOVELFORGE_LLAMACPP_SERVERS`` через запятую.
 STANDALONE_SERVERS = tuple(
     Path(p)
     for p in os.environ.get("NOVELFORGE_LLAMACPP_SERVERS", "").split(os.pathsep)
     if p.strip()
 )
+
+#: Где ещё искать ``llama-server.exe``. Одна только папка LM Studio не годится:
+#: без LM Studio внешний движок запускать нечем, хотя сборка может лежать рядом.
+#: Каталоги пробуются на глубину :data:`SEARCH_DEPTH`, отсутствующие пропускаются.
+SEARCH_ROOTS = (
+    Path(os.environ.get("LOCALAPPDATA", "")) / "Programs",
+    Path(os.environ.get("PROGRAMFILES", "")) / "llama.cpp",
+    Path(os.environ.get("LOCALAPPDATA", "")) / "llama.cpp",
+    Path("C:/llama.cpp"),
+    config.ROOT.parent,
+)
+
+#: Насколько глубоко заглядывать в каждый каталог поиска.
+SEARCH_DEPTH = 4
 
 
 @dataclass
@@ -71,15 +85,15 @@ class ExternalConfig:
     #: Одновременных предсказаний. Одно: каждая копия контекста ест память.
     parallel: int = 1
     #: Просить шаблон чата не размышлять. У Gemma-4 это убирает блок
-    #: ``<|channel>thought`` целиком — проверено.
+    #: ``<|channel>thought`` целиком.
     disable_thinking: bool = True
     #: Бюджет размышлений в токенах. Нужен для моделей, чей шаблон не принимает
     #: ``enable_thinking``: у DeepSeek-R1 такого поля нет вовсе, и отключить
     #: размышления нельзя — только ограничить. ``-1`` без ограничений, ``0``
     #: обрывает сразу, но **ноль бесполезен**: размышления не исчезают, а
     #: переезжают в сам ответ («Хм, пользователь просит…»). Разумное значение —
-    #: около 128: размышления укладываются в 387 символов, ответ приходит чистым,
-    #: а время падает с 16.5 до 7.3 c.
+    #: около 128: размышления укладываются в короткую заметку, ответ приходит
+    #: чистым и заметно быстрее.
     reasoning_budget: int = 256
     #: Имя, под которым модель видна в API.
     alias: str = "novelforge"
@@ -110,10 +124,38 @@ class ExternalConfig:
         return args + list(self.extra_args)
 
 
-def candidate_servers() -> list[Path]:
-    """Все найденные ``llama-server.exe``: сначала проверенные, потом прочие.
+def _servers_beside_roots() -> list[Path]:
+    """Ищет ``llama-server.exe`` в каталогах вне LM Studio.
 
-    Проверенные — сборки LM Studio: на них живая загрузка модели проходила.
+    Обход ограничен глубиной :data:`SEARCH_DEPTH`: сборки кладут и в корень
+    каталога, и в подпапку вида ``build/bin/Release``. Служебные каталоги
+    пропускаются, чтобы не ходить по чужим репозиториям.
+
+    @returns: найденные пути, по одному на сборку.
+    """
+    found: list[Path] = []
+    seen: set[Path] = set()
+    for root in SEARCH_ROOTS:
+        if not root.is_dir():
+            continue
+        base_depth = len(root.parts)
+        for current, dirs, files in os.walk(root):
+            here = Path(current)
+            if len(here.parts) - base_depth >= SEARCH_DEPTH:
+                dirs[:] = []
+            dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", "node_modules"}]
+            if "llama-server.exe" not in files:
+                continue
+            candidate = here / "llama-server.exe"
+            if candidate not in seen:
+                seen.add(candidate)
+                found.append(candidate)
+    return found
+
+
+def candidate_servers() -> list[Path]:
+    """Все найденные ``llama-server.exe``: сначала сборки LM Studio, потом прочие.
+
     Отдельные сборки идут последними, потому что ``--version`` их не разоблачает,
     а падают они уже при загрузке модели.
 
@@ -128,14 +170,16 @@ def candidate_servers() -> list[Path]:
             if server.exists():
                 found.append(server)
     found.extend(path for path in STANDALONE_SERVERS if path.exists())
+    known = set(found)
+    found.extend(path for path in _servers_beside_roots() if path not in known)
     return found
 
 
 def probe_server(server: Path, timeout_s: float = 20.0) -> bool:
     """Проверяет, что сборка запускается на этом процессоре.
 
-    Сборка с AVX-512 на Arrow Lake молча падает, поэтому «файл есть» ничего не
-    значит: нужен живой ответ на ``--version``.
+    Сборка с AVX-512 на процессоре без него молча падает, поэтому «файл есть»
+    ничего не значит: нужен ответ на ``--version``.
 
     @param server: путь к ``llama-server.exe``.
     @param timeout_s: сколько ждать ответа.
@@ -216,9 +260,9 @@ def is_external_url_alive(url: str, timeout_s: float = 5.0) -> bool:
     """Отвечает ли внешний сервер.
 
     Спрашивать только ``/health`` нельзя: у llama.cpp он есть, а **у LM Studio
-    его нет** — тот отвечает ``Unexpected endpoint or method``. Проверено живьём,
-    и на этом LM Studio выглядел бы мёртвым, хотя сервер работает. Поэтому
-    вторым идёт ``/v1/models``, который есть у обоих.
+    его нет** — тот отвечает ``Unexpected endpoint or method``. По одному
+    ``/health`` работающий LM Studio выглядел бы мёртвым. Поэтому вторым идёт
+    ``/v1/models``, который есть у обоих.
 
     @param url: базовый адрес вида ``http://127.0.0.1:1234``.
     @returns: ``True``, если сервер готов.
@@ -240,6 +284,114 @@ def is_external_url_alive(url: str, timeout_s: float = 5.0) -> bool:
     except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
         return False
     return isinstance(doc.get("data"), list)
+
+
+# --- модели LM Studio --------------------------------------------------------
+#
+# LM Studio держит загруженную модель в видеокарте и не отдаёт её по одному
+# запросу. Выгрузить и загрузить её можно своими адресами: без этого
+# переключение памяти не работает — модель занимает всю карту, и генератору
+# кадров не остаётся места.
+
+
+def list_server_model_info(url: str, timeout_s: float = 15.0) -> list[dict[str, Any]]:
+    """Подробный список моделей LM Studio: имя, размер, возможности.
+
+    Размер нужен, чтобы выбрать модель под свою карту, а не наугад: у сервера
+    в списке есть и семигигабайтные, и такие, что не влезут целиком.
+
+    @param url: базовый адрес сервера.
+    @param timeout_s: сколько ждать ответа.
+    @returns: записи с ключами ``name``, ``size_bytes``, ``quant``, ``vision``,
+        ``ctx``; пустой список, если сервер не ответил или он не LM Studio.
+    """
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/api/v1/models", timeout=timeout_s) as response:
+            doc = json.loads(response.read().decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
+        return []
+    models = doc.get("models")
+    if not isinstance(models, list):
+        return []
+    found: list[dict[str, Any]] = []
+    for model in models:
+        if not isinstance(model, dict) or not model.get("key"):
+            continue
+        capabilities = model.get("capabilities") or {}
+        quantization = model.get("quantization") or {}
+        found.append({
+            "name": str(model["key"]),
+            "size_bytes": int(model.get("size_bytes") or 0),
+            "quant": str(quantization.get("name") or ""),
+            "vision": bool(capabilities.get("vision")),
+            "ctx": int(model.get("max_context_length") or 0),
+        })
+    return found
+
+
+def lmstudio_loaded(url: str, timeout_s: float = 15.0) -> list[str]:
+    """Идентификаторы загруженных моделей LM Studio.
+
+    @param url: базовый адрес сервера.
+    @param timeout_s: сколько ждать ответа.
+    @returns: список ``instance_id``; пустой, если сервер не LM Studio.
+    """
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/api/v1/models", timeout=timeout_s) as response:
+            doc = json.loads(response.read().decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
+        return []
+    models = doc.get("models")
+    if not isinstance(models, list):
+        return []
+    loaded: list[str] = []
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        for instance in model.get("loaded_instances") or []:
+            if isinstance(instance, dict) and instance.get("id"):
+                loaded.append(str(instance["id"]))
+    return loaded
+
+
+def lmstudio_unload(url: str, instance_id: str, timeout_s: float = 60.0) -> bool:
+    """Выгружает модель LM Studio, освобождая видеопамять.
+
+    @param url: базовый адрес сервера.
+    @param instance_id: идентификатор загруженной модели.
+    @param timeout_s: сколько ждать ответа.
+    @returns: ``True``, если сервер принял выгрузку.
+    """
+    body = json.dumps({"instance_id": instance_id}).encode("utf-8")
+    request = urllib.request.Request(
+        url.rstrip("/") + "/api/v1/models/unload", data=body, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            return 200 <= response.status < 300
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def lmstudio_load(url: str, model: str, timeout_s: float = 300.0) -> bool:
+    """Загружает модель LM Studio обратно.
+
+    @param url: базовый адрес сервера.
+    @param model: имя модели, как его называет LM Studio.
+    @param timeout_s: сколько ждать загрузки.
+    @returns: ``True``, если модель загрузилась.
+    """
+    body = json.dumps({"model": model}).encode("utf-8")
+    request = urllib.request.Request(
+        url.rstrip("/") + "/api/v1/models/load", data=body, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            return 200 <= response.status < 300
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
 
 
 class ExternalController:

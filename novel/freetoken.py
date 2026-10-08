@@ -317,22 +317,48 @@ class FreeTokenClient:
             }
 
         gear = "off" if mode == "off" else "on"
-        kwargs = (control.get("kwargs") or {}).get(gear)
-        self.reasoning_kwargs = {"chat_template_kwargs": dict(kwargs)} if kwargs else None
+        by_gear = control.get("kwargs") or {}
+        gears = [str(name) for name in (control.get("gears") or [])]
+        kwargs = by_gear.get(gear)
+        chosen = gear
+        if kwargs is None and gears:
+            # У модели может не быть положения «выключено»: gpt-oss знает только
+            # слабое, среднее и сильное. Тогда берётся крайнее доступное — самое
+            # слабое для «off» и самое сильное для «on». Иначе размышления
+            # остаются на умолчании модели и съедают весь бюджет ответа.
+            chosen = gears[0] if mode == "off" else gears[-1]
+            kwargs = by_gear.get(chosen)
+        self.reasoning_kwargs = dict(kwargs) if kwargs else None
         return {
             "mode": mode,
             "model_default": control.get("default"),
+            "gear": chosen,
             "applied": self.reasoning_kwargs is not None,
             "kwargs": kwargs,
         }
 
     def _with_reasoning(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Добавляет в запрос управление размышлениями, если оно настроено."""
+        """Добавляет в запрос управление размышлениями, если оно настроено.
+
+        Поля раскладываются по двум местам, и это не прихоть: ``reasoning_effort``
+        серверы читают полем верхнего уровня, а всё, что касается шаблона чата
+        (``enable_thinking``, ``thinking_mode``), обязано лежать внутри
+        ``chat_template_kwargs``. Если положить шаблонное поле наверх, оно
+        пропадает молча, и модель продолжает размышлять.
+        """
         if not self.reasoning_kwargs:
             return body
         template = dict(body.get("chat_template_kwargs") or {})
         template.update(self.reasoning_kwargs.get("chat_template_kwargs") or {})
-        body["chat_template_kwargs"] = template
+        for key, value in self.reasoning_kwargs.items():
+            if key == "chat_template_kwargs":
+                continue
+            if key == "reasoning_effort":
+                body["reasoning_effort"] = value
+            else:
+                template[key] = value
+        if template:
+            body["chat_template_kwargs"] = template
         return body
 
     def count_tokens(

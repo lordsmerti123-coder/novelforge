@@ -20,9 +20,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from novel import prompts
+from novel import prompts, quest
 from novel.db import Memory, Message, NovelDB
-from novel.formats import DialogueFormat, get_format
+from novel.formats import DialogueFormat, effective_images, resolve_format
 from novel.freetoken import FreeTokenClient, FreeTokenError
 from novel.vision import user_message
 
@@ -168,21 +168,31 @@ class ContextBuilder:
         """
         session = self.db.session(session_id)
         world = self.db.world(session.world_id) if session else None
-        fmt = get_format(world.format if world else "story")
+        # Формат принадлежит партии: один мир проходят и прозой, и перепиской.
+        fmt = resolve_format(
+            session.format if session else "",
+            world.format if world else "",
+        )
 
+        image_policy, image_frame = effective_images(world, self.settings_provider())
         blocks: list[tuple[str, str, str]] = [
-            # Политика картинок влияет на инструкцию: при «каждом ходу» ведущий
-            # обязан ставить блок сцены в каждом ответе, иначе политике нечего
-            # рисовать. В переписке кадр — портрет собеседника, если так решено.
+            # Когда рисовать кадры и что в них показывать, влияет на инструкцию:
+            # при «каждом ходу» ведущий обязан ставить блок сцены в каждом
+            # ответе, иначе политике нечего рисовать; при «никогда» блока нет.
             ("format", "Формат и протокол", prompts.base_instruction(
                 fmt,
-                getattr(self.settings_provider(), "image_policy", "minimal"),
-                self._portrait_mode(fmt),
+                image_policy,
+                image_frame != "scene",
             )),
         ]
         if world is not None:
             blocks.append(("world", "Мир", prompts.world_block(world)))
             blocks.append(("rules", "Правила", prompts.rules_block(self.db.rules(world.id, enabled_only=True))))
+            # Рамка квеста идёт сразу после правил: это границы истории, и всё
+            # остальное — персонажи, стиль, вещи — подчиняется им.
+            quest_layer = self._quest_layer(session_id)
+            if quest_layer:
+                blocks.append(("quest", "Квест", quest_layer))
             blocks.append(
                 ("characters", "Персонажи", prompts.characters_block(self.db.characters(world.id, enabled_only=True)))
             )
@@ -224,6 +234,12 @@ class ContextBuilder:
         # стоять вплотную к истории, иначе длинная проза в окне перебивает
         # инструкцию формата — модель просто продолжает то, что видит.
         reminder = prompts.style_reminder(fmt, self._persona_lines(session_id))
+        # Напоминание о кадре идёт вплотную к истории, после напоминания о стиле:
+        # ведущий повторяет то, что видит последним, и просьба в начале промпта
+        # до него не доходит.
+        scene_note = prompts.scene_reminder(fmt, image_frame)
+        if scene_note and image_policy != "never":
+            reminder = f"{reminder}\n\n{scene_note}" if reminder else scene_note
         if reminder:
             blocks.append(("reminder", "Напоминание о стиле", reminder))
 
@@ -233,6 +249,24 @@ class ContextBuilder:
             if text.strip()
         ]
         return layers, fmt
+
+    def _quest_layer(self, session_id: int) -> str:
+        """Слой квеста, если партия идёт по заранее написанному сюжету.
+
+        Ключ квеста хранится в состоянии партии, а не в мире: один и тот же мир
+        квеста можно пройти несколько раз, и у каждой партии свой ход событий.
+
+        @param session_id: партия.
+        @returns: текст слоя либо пустая строка.
+        """
+        key = str(self.db.get_state(session_id, quest.QUEST_KEY, "") or "")
+        if not key:
+            return ""
+        definition = quest.get_quest(key)
+        if not definition:
+            return ""
+        state = quest.read_state(self.db, session_id, definition)
+        return prompts.quest_block(definition, state)
 
     def _persona_lines(self, session_id: int, limit: int = 3) -> list[str]:
         """Короткие подсказки о характере собеседников.
@@ -342,7 +376,11 @@ class ContextBuilder:
         settings = self.settings_provider()
         warnings: list[str] = []
         budget = int(getattr(settings, "context_budget_tokens", 16384))
-        reserve = int(getattr(settings, "max_tokens", 900))
+        # Запас под ответ считается вместе с размышлениями: они идут по тому
+        # же счёту, и без этого промпт и вывод вместе не влезают в окно.
+        budget_fn = getattr(settings, "output_budget", None)
+        reserve = (budget_fn() if callable(budget_fn)
+                   else int(getattr(settings, "max_tokens", 900)))
 
         stable, fmt = self.stable_layers(session_id)
         stable_tokens = sum(layer.tokens for layer in stable)
@@ -408,19 +446,24 @@ class ContextBuilder:
             exact_tokens=exact,
         )
 
-    def _portrait_mode(self, fmt: Any) -> bool:
-        """Рисовать ли в этом формате портрет собеседника вместо сцены.
+    def _portrait_mode(self, fmt: Any, world: Any = None) -> bool:
+        """Рисовать ли собеседника крупным планом вместо сцены.
 
-        Портрет имеет смысл только в переписке, где игрок говорит с одним
-        человеком: там кадр работает карточкой собеседника. В прозе идёт
-        история, и портрет в ней был бы неуместен.
+        Выбор «что в кадре» общий для всех типов повествования: задаётся у мира,
+        а если у мира пусто — в общих настройках. Прежде он действовал только в
+        переписке, и в истории с квестом переключатель молча ничего не менял.
 
-        @param fmt: формат диалога.
-        @returns: True, если ведущий должен описывать портрет.
+        Крупный план берётся из глаз игрока — он видит того, с кем говорит,
+        а не себя со стороны.
+
+        @param fmt: тип повествования.
+        @param world: мир этой партии; допускается ``None``.
+        @returns: True, если ведущий должен описывать собеседника.
         """
-        if not fmt.wants_scene or fmt.ui not in ("chat", "photo_chat"):
+        if not fmt.wants_scene:
             return False
-        return getattr(self.settings_provider(), "chat_frame", "portrait") == "portrait"
+        _, frame = effective_images(world, self.settings_provider())
+        return frame != "scene"
 
     def _items_layer(self, world: Any) -> str:
         """Собирает список вещей по владельцам.

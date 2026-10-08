@@ -24,10 +24,10 @@ from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from novel import config  # noqa: E402
+from novel import config, quest  # noqa: E402
 from novel.comfy import ComfyClient, ComfyError  # noqa: E402
 from novel.db import NovelDB  # noqa: E402
-from novel.formats import FORMATS, get_format, list_formats  # noqa: E402
+from novel.formats import FORMATS, get_format, list_formats, resolve_format  # noqa: E402
 from novel.freetoken import FreeTokenError  # noqa: E402
 from novel.machine import (  # noqa: E402
     DEFAULT_NOTE_HORIZON,
@@ -35,14 +35,20 @@ from novel.machine import (  # noqa: E402
     PLAYER_NOTE_LIMIT,
     NovelMachine,
 )
-from novel.external import is_external_url_alive, list_server_models  # noqa: E402
+from novel.external import is_external_url_alive, list_server_model_info, list_server_models  # noqa: E402
 from novel.models import ModelRegistry, engine_for_kind, preset_for  # noqa: E402
 from novel.presets import get_preset, list_presets  # noqa: E402
+from novel.readiness import check_readiness, free_vram_gb  # noqa: E402
 from novel.settings import IMAGE_QUALITY, SettingsStore  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-app = FastAPI(title="NovelForge", version="0.2.0")
+#: Версия проекта. Показывается в шапке страницы рядом с меткой сборки: по ней
+#: видно, какая сборка открыта в браузере, — страница кэшируется, и без метки
+#: легко смотреть на старую.
+APP_VERSION = "0.3.0"
+
+app = FastAPI(title="NovelForge", version=APP_VERSION)
 
 config.ensure_dirs()
 _db = NovelDB()
@@ -54,6 +60,16 @@ _settings_store.load()
 config.use_settings(_settings_store.settings)
 _registry = ModelRegistry()
 _machine = NovelMachine(_db, _settings_store, _registry)
+
+# Модель под уже выбранный движок подбирается сразу: если пользователь вернулся
+# к движку, с которого уходил, должна подставиться знакомая модель, а не пустой
+# путь. Память при этом не занимается — движок поднимается отдельно.
+try:
+    _startup_choice = _machine.resolve_model()
+    if _startup_choice.get("changed"):
+        _settings_store.save()
+except (OSError, RuntimeError, ValueError) as exc:  # noqa: BLE001 — выбор не критичен для старта
+    _startup_choice = {"error": str(exc)}
 
 _task_lock = threading.Lock()
 _task: dict[str, Any] = {"running": False, "kind": None, "started_at": None, "error": None}
@@ -80,7 +96,7 @@ class WorldRequest(BaseModel):
 
     name: str
     brief: str = ""
-    format: str = "story"
+    format: str = ""
     preset_key: str | None = None
 
 
@@ -108,6 +124,8 @@ class CharacterRequest(BaseModel):
     description: str = ""
     appearance: str = ""
     speech: str = ""
+    #: Образцы настоящих сообщений человека, по строке на образец.
+    voice: str = ""
     enabled: bool = True
 
 
@@ -116,6 +134,8 @@ class SessionRequest(BaseModel):
 
     world_id: int
     title: str = ""
+    #: Формат диалога; пустая строка означает «как у мира».
+    format: str = ""
 
 
 class GenerateRequest(BaseModel):
@@ -216,6 +236,19 @@ def api_agent_stop() -> dict[str, Any]:
     return {"requested": True}
 
 
+def _start_engine() -> None:
+    """Поднимает движок и переносит причину отказа в состояние задачи.
+
+    ``ensure_engine`` не бросает исключение, а возвращает отчёт: причина отказа
+    иначе осталась бы только в журнале движка, а пользователь нажал кнопку и
+    ждёт объяснения.
+    """
+    report = _machine.ensure_engine()
+    if not report.get("ready") and report.get("error"):
+        with _task_lock:
+            _task["error"] = str(report["error"])
+
+
 def _run_task(kind: str, target: Any) -> bool:
     """Запускает операцию в отдельном потоке, если ничего не выполняется.
 
@@ -292,13 +325,29 @@ def index() -> HTMLResponse:
         raise HTTPException(status_code=500, detail="не найден index.html")
     stamp = time.strftime("%d.%m %H:%M:%S", time.localtime(page.stat().st_mtime))
     return HTMLResponse(
-        page.read_text(encoding="utf-8").replace("<!--ВЕРСИЯ-->", f"сборка {stamp}"),
+        page.read_text(encoding="utf-8").replace(
+            "<!--ВЕРСИЯ-->", f"{APP_VERSION} · сборка {stamp}"
+        ),
         headers={
             "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
             "Pragma": "no-cache",
             "Expires": "0",
         },
     )
+
+
+@app.get("/api/readiness")
+def api_readiness() -> dict[str, Any]:
+    """Что есть на машине, чего нет и что с этим делать.
+
+    Нужно новому пользователю: у него может не быть ни движков, ни моделей.
+    Пустой список моделей сам по себе ничего не объясняет, а эта сводка
+    называет причину и подсказывает, где взять недостающее.
+    """
+    report = check_readiness(_registry)
+    doc = report.as_dict()
+    doc["free_vram_gb"] = free_vram_gb()
+    return doc
 
 
 @app.get("/api/status")
@@ -326,8 +375,32 @@ def api_formats() -> list[dict[str, Any]]:
 
 @app.get("/api/presets")
 def api_presets() -> list[dict[str, Any]]:
-    """Список готовых миров."""
-    return list_presets()
+    """Список готовых миров: заготовки и квесты одним списком.
+
+    Квесты идут первыми: у них написан сюжет, и выбрать их стоит раньше
+    свободных заготовок. Тип повествования указывается у каждого: без него в
+    списке не отличить историю от переписки — они выглядят одинаково.
+    """
+    quests = [
+        {
+            **item,
+            "kind": "quest",
+            # Квест — это история плюс сценарий, поэтому и тип у него свой.
+            "format": "quest",
+            "format_title": get_format("quest").title,
+        }
+        for item in quest.list_quests()
+    ]
+    presets = []
+    for item in list_presets():
+        key = str(item.get("format") or "story")
+        presets.append({
+            **item,
+            "kind": "preset",
+            "format": key,
+            "format_title": get_format(key).title,
+        })
+    return quests + presets
 
 
 # --- настройки и модели ------------------------------------------------------
@@ -356,15 +429,28 @@ def api_set_settings(request: SettingsRequest) -> dict[str, Any]:
     if "reasoning_mode" in request.changes and not rejected:
         # Новый режим применится к следующему запросу, а не к уже начатому.
         _machine.invalidate_reasoning()
+    # Смена модели — не смена движка, но поднятый движок обслуживает прежнюю.
+    # Проверка в движке сработала бы только на следующем ходу, а до него
+    # выглядит так, будто смена не применилась.
+    if "model_path" in request.changes and not rejected:
+        retired = _machine.retire_stale_engine()
+        _machine.invalidate_reasoning()
+        return {"settings": _settings_store.settings.to_dict(),
+                "rejected": rejected, "retired_engine": retired}
+
     engine_fields = {"engine_kind", "external_url", "external_server_path",
                      "external_manage", "external_context", "external_gpu_layers"}
     if engine_fields & set(request.changes) and not rejected:
         # Движок мог смениться целиком: у FreeToken и llama.cpp разные клиент,
-        # контроллер и, главное, адрес.
+        # контроллер и, главное, адрес. Модель прежнего движка новому не годится,
+        # поэтому подбирается своя — знакомая или подходящая по памяти.
         engine = _machine.sync_engine()
         _machine.invalidate_reasoning()
+        choice = _machine.resolve_model()
+        if choice.get("changed"):
+            _settings_store.save()
         return {"settings": _settings_store.settings.to_dict(),
-                "rejected": rejected, "engine": engine}
+                "rejected": rejected, "engine": engine, "model_choice": choice}
     comfy_fields = {"comfy_root", "comfy_input_dir", "comfy_output_dir",
                     "comfy_server_script", "comfy_model_paths"}
     if comfy_fields & set(request.changes) and not rejected:
@@ -459,27 +545,38 @@ def api_models(refresh: bool = False) -> dict[str, Any]:
         (visible if fits else hidden).append(model)
 
     # У подключённого сервера свои имена моделей: LM Studio ждёт
-    # «имя-модели-в-нижнем-регистре», а не путь к файлу. Его список
-    # идёт первым, потому что именно эти имена сервер и принимает.
+    # «имя-модели-в-нижнем-регистре», а не путь к файлу. Список берётся всегда,
+    # а не только при внешнем движке: иначе с FreeToken нельзя было бы выбрать
+    # модель сервера и вернуться на llama.cpp.
     server_models: list[dict[str, Any]] = []
-    if external:
-        url = str(_settings_store.settings.external_url)
-        if is_external_url_alive(url):
-            for name in list_server_models(url):
-                server_models.append({
-                    "path": name, "name": name, "kind": "server",
-                    "model_type": "внешний", "size_gb": 0.0,
-                    "experts": None, "experts_per_tok": None, "quant": None,
-                    "max_ctx": None, "supported": True,
-                    "note": "модель внешнего сервера",
-                })
+    url = str(_settings_store.settings.external_url)
+    if is_external_url_alive(url):
+        # Размер и квантование сервер сообщает сам: без них строка модели
+        # выглядела бы как «0 GB», и по ней нельзя выбрать, что влезет в карту.
+        for info in list_server_model_info(url):
+            name = info["name"]
+            size_gb = round(int(info["size_bytes"]) / 1024 ** 3, 2)
+            quant = info["quant"] or None
+            server_models.append({
+                "path": name, "name": name, "kind": "server",
+                "model_type": "внешний", "size_gb": size_gb,
+                "experts": None, "experts_per_tok": None, "quant": quant,
+                "max_ctx": info["ctx"] or None, "supported": external,
+                "note": "модель внешнего сервера",
+            })
+    # В списке только то, что запустит текущий движок: у FreeToken это каталоги
+    # HF и FTW, у внешнего — модели сервера и GGUF. Смешивать наборы незачем —
+    # половина строк заведомо не запустится. Движок переключается селектором
+    # выше, поэтому тупика нет.
+    fitting = visible + (server_models if external else [])
     return {
-        "models": server_models + visible,
+        "models": fitting,
         "hidden": len(hidden),
+        "other_engine": len(hidden) + (0 if external else len(server_models)),
         "current": str(_settings_store.settings.model_path),
         "engine_kind": engine,
         "server_models": len(server_models),
-        "supported": [model for model in server_models + visible if model["supported"]],
+        "supported": [model for model in fitting if model["supported"]],
     }
 
 
@@ -500,10 +597,11 @@ def api_select_model(request: SelectModelRequest) -> dict[str, Any]:
     показывает его как обычную операцию.
     """
     model = _registry.by_path(request.path)
-    external = str(_settings_store.settings.engine_kind) == "external"
     # Имена моделей внешнего сервера в реестре не лежат — их предлагает сам
-    # сервер, и проверять их по диску нечем.
-    from_server = model is None and external and is_external_url_alive(
+    # сервер, и проверять их по диску нечем. Спрашиваем сервер независимо от
+    # того, какой движок выбран сейчас: иначе с FreeToken нельзя было бы
+    # вернуться на llama.cpp — прежний движок ещё стоит, а имя уже не опознать.
+    from_server = model is None and is_external_url_alive(
         str(_settings_store.settings.external_url)
     ) and request.path in list_server_models(str(_settings_store.settings.external_url))
     if model is None and not from_server:
@@ -516,6 +614,11 @@ def api_select_model(request: SelectModelRequest) -> dict[str, Any]:
     # на llama.cpp, и это само по себе требует перезапуска — старый движок
     # обслуживает другой чекпоинт и другую модель вовсе.
     previous_engine = str(settings.engine_kind)
+    # Запущен ли прежний движок, спрашиваем тоже до смены: sync_engine() ниже
+    # переводит контроллер на новый порт, и там уже никого нет. После этого
+    # «движок запущен» стало бы ложью, перезапуск не начался бы, а прежняя
+    # модель — та, что держит видеопамять, — так и осталась бы висеть.
+    engine_running = _machine.controller.port_pid() is not None
 
     # Движок выбирается по виду модели, а не отдельной галочкой: GGUF умеет
     # только llama.cpp, каталоги HF и родной FTW — только FreeToken. Иначе выбор
@@ -542,10 +645,12 @@ def api_select_model(request: SelectModelRequest) -> dict[str, Any]:
     # один и тот же (1919), поэтому на нём может ещё висеть прежний процесс.
     # Без этого условия ensure_engine() видел бы живой чужой движок, отвечал бы
     # «уже поднят» и модель применялась бы только со второго раза.
-    engine_running = _machine.controller.port_pid() is not None
     engine_changed = wanted != previous_engine
 
     settings.model_path = request.path if from_server else model.path
+    # Выбор запоминается для своего движка: при возврате на него подставится
+    # именно эта модель, а не первая из списка.
+    settings.remember_model(wanted, settings.model_path)
     applied: dict[str, Any] = {}
     if request.apply_preset and model is not None:
         applied = preset_for(model.model_type)
@@ -583,8 +688,8 @@ def api_kill(request: KillRequest) -> dict[str, Any]:
 
 @app.post("/api/engine/start")
 def api_engine_start() -> dict[str, Any]:
-    """Поднимает движок FreeToken в фоне."""
-    if not _run_task("engine_start", _machine.ensure_engine):
+    """Поднимает движок в фоне."""
+    if not _run_task("engine_start", _start_engine):
         return _busy_response()
     return {"accepted": True}
 
@@ -620,21 +725,32 @@ def api_worlds() -> list[dict[str, Any]]:
 
 @app.post("/api/worlds")
 def api_create_world(request: WorldRequest) -> dict[str, Any]:
-    """Создаёт мир, при необходимости из пресета."""
+    """Создаёт мир из заготовки или квеста."""
+    # Заготовка и квест приходят одним полем: квест — та же заготовка, только
+    # с написанным сюжетом, местами и предметами.
     preset = get_preset(request.preset_key) if request.preset_key else None
+    story = quest.get_quest(request.preset_key) if request.preset_key else None
+    source = preset or story
+
+    # Мир из квестовой заготовки получает тип «Квест»: у него написан сюжет.
+    # Остальные поля берутся у заготовки, а чего у неё нет — из запроса.
+    default_format = "quest" if story else "story"
+    source = source or {}
     world_id = _db.create_world(
-        name=request.name or (preset["title"] if preset else "Новый мир"),
-        format=request.format if request.format in FORMATS else "story",
-        brief=request.brief or (preset["brief"] if preset else ""),
-        genre=preset["genre"] if preset else "",
-        tone=preset["tone"] if preset else "",
-        style=preset["style"] if preset else "",
-        narrator=preset["narrator"] if preset else "",
+        name=request.name or (source.get("title") or "Новый мир"),
+        format=request.format if request.format in FORMATS else (source.get("format") or default_format),
+        brief=request.brief or (source.get("brief") or ""),
+        genre=source.get("genre") or "",
+        tone=source.get("tone") or "",
+        style=source.get("style") or "",
+        narrator=source.get("narrator") or "",
+        image_policy=source.get("image_policy") or "",
+        image_frame=source.get("image_frame") or "",
     )
-    if preset:
-        for rule in preset["rules"]:
+    if source:
+        for rule in source.get("rules") or []:
             _db.add_rule(world_id, rule["body"], title=rule["title"], kind="rule")
-        for character in preset["characters"]:
+        for character in source.get("characters") or []:
             _db.add_character(
                 world_id,
                 character["name"],
@@ -642,9 +758,28 @@ def api_create_world(request: WorldRequest) -> dict[str, Any]:
                 description=character["description"],
                 appearance=character["appearance"],
                 speech=character["speech"],
+                voice=str(character.get("voice") or ""),
             )
+
     session_id = _db.create_session(world_id, title="Первая партия")
-    return {"world_id": world_id, "session_id": session_id}
+
+    if story:
+        # Места квеста сразу попадают в реестр мира: по ним ведущий рисует
+        # кадры, и без этого одно и то же место каждый раз выглядело бы новым.
+        for place in story.get("locations") or []:
+            _db.add_location(
+                world_id,
+                str(place.get("name") or place.get("id")),
+                prompt=str(place.get("prompt") or ""),
+                style=str(story.get("style") or ""),
+            )
+        _db.set_state(session_id, quest.QUEST_KEY, str(story["key"]))
+        start = quest.initial_state(story)
+        quest.write_state(_db, session_id, start)
+        # Вещи, с которыми игрок пришёл, сразу видны в панели инвентаря.
+        quest.sync_inventory(_db, world_id, story, start)
+
+    return {"world_id": world_id, "session_id": session_id, "quest": bool(story)}
 
 
 @app.get("/api/worlds/{world_id}")
@@ -858,6 +993,7 @@ def api_add_character(world_id: int, request: CharacterRequest) -> dict[str, Any
         description=request.description,
         appearance=request.appearance,
         speech=request.speech,
+        voice=request.voice,
     )
     if not request.enabled:
         _db.update_character(character_id, {"enabled": 0})
@@ -897,10 +1033,17 @@ def api_sessions(world_id: int | None = None) -> list[dict[str, Any]]:
 
 @app.post("/api/sessions")
 def api_create_session(request: SessionRequest) -> dict[str, Any]:
-    """Создаёт партию в мире."""
+    """Создаёт партию в мире.
+
+    Формат задаётся у партии: один мир проходят и прозой, и перепиской.
+    Незаданный формат означает «как у мира».
+    """
     _world_or_404(request.world_id)
-    session_id = _db.create_session(request.world_id, request.title or "Новая партия")
-    return {"session_id": session_id}
+    chosen = request.format if request.format in FORMATS else ""
+    session_id = _db.create_session(
+        request.world_id, request.title or "Новая партия", format=chosen
+    )
+    return {"session_id": session_id, "format": chosen}
 
 
 @app.delete("/api/sessions/{session_id}")
@@ -915,6 +1058,26 @@ class RenameRequest(BaseModel):
     """Переименование партии."""
 
     title: str
+
+
+class FormatRequest(BaseModel):
+    """Смена формата диалога у партии."""
+
+    format: str = ""
+
+
+@app.post("/api/sessions/{session_id}/format")
+def api_session_format(session_id: int, request: FormatRequest) -> dict[str, Any]:
+    """Меняет формат диалога у партии.
+
+    Прошлые ходы остаются как были — переписывать историю нельзя. Новый формат
+    действует со следующего хода. Пустой формат означает «как у мира».
+    """
+    _session_or_404(session_id)
+    if request.format and request.format not in FORMATS:
+        return {"rejected": [f"формата «{request.format}» нет"]}
+    _db.set_session_format(session_id, request.format)
+    return {"format": request.format, "rejected": []}
 
 
 class ImportRequest(BaseModel):
@@ -1179,10 +1342,23 @@ def api_backups() -> list[dict[str, Any]]:
 
 @app.post("/api/sessions/{session_id}/clear")
 def api_clear_session(session_id: int) -> dict[str, Any]:
-    """Очищает партию, оставляя мир."""
-    _session_or_404(session_id)
+    """Очищает партию, оставляя мир.
+
+    У квеста очистка начинает сюжет заново: история пропадает, а сам квест
+    остаётся. Без этого ключ квеста стирался бы вместе с состоянием, и партия
+    превращалась бы в обычную песочницу.
+    """
+    session = _session_or_404(session_id)
+    key = str(_db.get_state(session_id, quest.QUEST_KEY, "") or "")
     _db.clear_session(session_id)
-    return {"cleared": session_id}
+    if key:
+        definition = quest.get_quest(key)
+        if definition:
+            _db.set_state(session_id, quest.QUEST_KEY, key)
+            start = quest.initial_state(definition)
+            quest.write_state(_db, session_id, start)
+            quest.sync_inventory(_db, session.world_id, definition, start)
+    return {"cleared": session_id, "quest": bool(key)}
 
 
 @app.post("/api/sessions/{session_id}/summarize")
@@ -1221,9 +1397,16 @@ def api_history(session_id: int) -> dict[str, Any]:
     """Сообщения, сцены и состояние мира партии."""
     session = _session_or_404(session_id)
     world = _db.world(session.world_id)
-    fmt = get_format(world.format if world else "story")
+    fmt = resolve_format(session.format, world.format if world else "")
     return {
-        "session": {"id": session.id, "title": session.title, "world_id": session.world_id},
+        "session": {
+            "id": session.id,
+            "title": session.title,
+            "world_id": session.world_id,
+            # Пустая строка означает «как у мира»: в списке партии стоит первый
+            # пункт, а действующий формат виден рядом.
+            "format": session.format,
+        },
         "world": {"id": world.id, "name": world.name, "format": fmt.key} if world else None,
         "format": fmt.as_dict(),
         "messages": [

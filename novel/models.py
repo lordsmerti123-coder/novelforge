@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import json
 import os
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from novel import config
 
@@ -246,6 +247,100 @@ def _scan_folders(root: Path) -> list[LocalModel]:
     return found
 
 
+#: Типы значений в метаданных GGUF. Размер известен у чисел, у строки и массива
+#: он записан перед значением, поэтому их читают отдельно.
+_GGUF_FIXED_SIZE = {
+    0: 1,   # uint8
+    1: 1,   # int8
+    2: 2,   # uint16
+    3: 2,   # int16
+    4: 4,   # uint32
+    5: 4,   # int32
+    6: 4,   # float32
+    7: 1,   # bool
+    10: 8,  # uint64
+    11: 8,  # int64
+    12: 8,  # float64
+}
+_GGUF_STRING = 8
+_GGUF_ARRAY = 9
+
+#: Ключ метаданных, в котором лежит имя архитектуры.
+_GGUF_ARCH_KEY = "general.architecture"
+
+#: Сколько ключей просматривать в поисках архитектуры. Обычно она первая, но
+#: порядок ключей в файле не гарантирован.
+_GGUF_MAX_KEYS = 128
+
+
+def _gguf_string(handle: BinaryIO) -> str:
+    """Читает строку GGUF: длина восемью байтами, затем сами байты.
+
+    @param handle: открытый файл на позиции строки.
+    @returns: прочитанный текст.
+    @raises ValueError: если длина неправдоподобна — файл не похож на GGUF.
+    """
+    length = struct.unpack("<Q", handle.read(8))[0]
+    if length > 1 << 20:
+        raise ValueError("неправдоподобная длина строки")
+    return handle.read(length).decode("utf-8", "replace")
+
+
+def _skip_gguf_value(handle: BinaryIO, value_type: int, depth: int = 0) -> None:
+    """Пропускает значение метаданных, не разбирая его.
+
+    @param handle: открытый файл на позиции значения.
+    @param value_type: тип значения из заголовка.
+    @param depth: глубина вложенности массивов.
+    @raises ValueError: если тип незнаком или вложенность чрезмерна.
+    """
+    if value_type == _GGUF_STRING:
+        _gguf_string(handle)
+        return
+    if value_type == _GGUF_ARRAY:
+        if depth > 4:
+            raise ValueError("слишком глубокая вложенность массива")
+        element_type = struct.unpack("<I", handle.read(4))[0]
+        count = struct.unpack("<Q", handle.read(8))[0]
+        if count > 1 << 24:
+            raise ValueError("неправдоподобная длина массива")
+        for _ in range(count):
+            _skip_gguf_value(handle, element_type, depth + 1)
+        return
+    size = _GGUF_FIXED_SIZE.get(value_type)
+    if size is None:
+        raise ValueError(f"незнакомый тип значения {value_type}")
+    handle.read(size)
+
+
+def gguf_architecture(path: Path) -> str:
+    """Читает имя архитектуры из заголовка GGUF-файла.
+
+    В заголовке лежит ключ ``general.architecture`` с настоящим именем, поэтому
+    угадывать по имени файла не нужно: у ``DeepSeek-Coder-V2-Lite-IQ3_M.gguf``
+    слова ``deepseek2`` в имени нет, а в заголовке оно есть.
+
+    @param path: файл модели.
+    @returns: имя архитектуры; пустая строка, если прочитать не удалось.
+    """
+    try:
+        with open(path, "rb") as handle:
+            if handle.read(4) != b"GGUF":
+                return ""
+            handle.read(4)   # версия формата
+            handle.read(8)   # число тензоров
+            key_count = struct.unpack("<Q", handle.read(8))[0]
+            for _ in range(min(key_count, _GGUF_MAX_KEYS)):
+                key = _gguf_string(handle)
+                value_type = struct.unpack("<I", handle.read(4))[0]
+                if key == _GGUF_ARCH_KEY and value_type == _GGUF_STRING:
+                    return _gguf_string(handle)
+                _skip_gguf_value(handle, value_type)
+    except (OSError, ValueError, struct.error):
+        return ""
+    return ""
+
+
 def _scan_gguf(root: Path, min_gb: float = 3.0) -> list[LocalModel]:
     """Ищет одиночные GGUF-файлы — только чтобы показать, что они есть.
 
@@ -253,7 +348,7 @@ def _scan_gguf(root: Path, min_gb: float = 3.0) -> list[LocalModel]:
     зарегистрирована одна `gemma4`, и даже она падает: конфиг из GGUF —
     замороженный dataclass, а движок присваивает ему поля. Поэтому файлы
     помечаются неподдерживаемыми: иначе список моделей состоит из мёртвых
-    вариантов, а выбор каждого оборачивается пятиминутным отказом запуска.
+    вариантов, а выбор каждого оборачивается долгим отказом запуска.
 
     Найти их всё равно полезно: видно, что лежит на диске. Путь к рабочей
     модели — выгрузка safetensors и ``ft checkpoint``.
@@ -271,8 +366,18 @@ def _scan_gguf(root: Path, min_gb: float = 3.0) -> list[LocalModel]:
             continue
         if size_gb < min_gb:
             continue
-        lowered = path.name.lower()
-        guess = next((kind for kind in known if kind.replace("_", "") in lowered.replace("_", "").replace("-", "")), "?")
+        # Архитектура берётся из заголовка файла, а имя — только запасной
+        # источник: в имени её часто нет вовсе, и тогда остаётся «?».
+        architecture = gguf_architecture(path)
+        if architecture:
+            guess = architecture
+        else:
+            lowered = path.name.lower()
+            guess = next(
+                (kind for kind in known
+                 if kind.replace("_", "") in lowered.replace("_", "").replace("-", "")),
+                "?",
+            )
         found.append(
             LocalModel(
                 path=str(path),
@@ -329,3 +434,29 @@ class ModelRegistry:
     def as_dicts(self, refresh: bool = False) -> list[dict[str, Any]]:
         """Список моделей для интерфейса."""
         return [model.as_dict() for model in self.all(refresh=refresh)]
+
+
+#: Сколько видеопамяти оставить на сами вычисления и контекст поверх весов.
+VRAM_RESERVE_GB = 2.0
+
+
+def pick_best_model(candidates: list[tuple[str, float]], budget_gb: float) -> str:
+    """Выбирает самую крупную модель, которая помещается в память.
+
+    Крупнее — обычно умнее, поэтому при прочих равных берётся самая большая из
+    тех, что влезают. Если не влезает ни одна, возвращается самая маленькая:
+    она хотя бы может запуститься частичной выгрузкой.
+
+    @param candidates: пары «имя или путь», «размер в ГБ».
+    @param budget_gb: сколько памяти доступно движку.
+    @returns: имя выбранной модели; пустая строка, если выбирать не из чего.
+    """
+    if not candidates:
+        return ""
+    limit = max(budget_gb - VRAM_RESERVE_GB, 1.0)
+    fitting = [item for item in candidates if 0 < item[1] <= limit]
+    if fitting:
+        return max(fitting, key=lambda item: item[1])[0]
+    # Ничего не влезает целиком: берём самую маленькую — у неё больше шансов
+    # подняться с частичной выгрузкой.
+    return min(candidates, key=lambda item: item[1] or 0)[0]

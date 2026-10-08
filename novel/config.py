@@ -45,6 +45,30 @@ FREETOKEN_HOME = Path(
 FREETOKEN_FT_EXE = FREETOKEN_HOME / "venv" / "Scripts" / "ft.exe"
 FREETOKEN_PYTHON = FREETOKEN_HOME / "venv" / "Scripts" / "python.exe"
 
+#: Где взять движок. Показывается в подсказке, когда FreeToken не найден:
+#: без него текстовый движок не поднять, и человек должен знать, что скачать.
+FREETOKEN_DOWNLOAD = "https://www.flashml.ai/"
+FREETOKEN_REPOSITORY = "https://github.com/FlashML-org/FreeToken"
+
+
+def freetoken_problem() -> str:
+    """Объясняет, почему FreeToken нельзя запустить.
+
+    Проверка нужна до запуска процесса: без неё ``Popen`` падает с
+    ``FileNotFoundError``, и пользователь видит ошибку Windows вместо причины.
+
+    @returns: пустая строка, если движок на месте; иначе что не так.
+    """
+    if FREETOKEN_FT_EXE.is_file():
+        return ""
+    if not FREETOKEN_HOME.exists():
+        return (f"FreeToken не установлен (нет каталога {FREETOKEN_HOME}). "
+                f"Поставьте его с {FREETOKEN_DOWNLOAD} — приложение создаст движок "
+                f"само, — или укажите свой каталог переменной NOVELFORGE_FT_HOME.")
+    return (f"в каталоге {FREETOKEN_HOME} нет {FREETOKEN_FT_EXE.name}. "
+            f"Похоже, установка не завершена: запустите FreeToken Desktop хотя бы "
+            f"раз или переустановите его с {FREETOKEN_DOWNLOAD}.")
+
 # --- ComfyUI -----------------------------------------------------------------
 #
 # Где стоит ComfyUI, у каждого своё, поэтому путь задаёт пользователь — во
@@ -67,11 +91,28 @@ DEFAULT_COMFY_DESKTOP_EXE = Path(
     os.environ.get("NOVELFORGE_COMFY_DESKTOP", r"C:\Program Files\Comfy Desktop\Comfy Desktop.exe")
 )
 DEFAULT_COMFY_SERVER_SCRIPT = os.environ.get("NOVELFORGE_COMFY_SCRIPT", r"ComfyUI\main.py")
-DEFAULT_COMFY_MODEL_PATHS = Path(os.environ.get(
-    "NOVELFORGE_COMFY_PATHS",
-    str(Path(os.environ.get("APPDATA", "")) / "Comfy Desktop"
-        / "instance-model-paths" / "inst-1781266641216.yaml"),
-))
+
+
+def _comfy_model_paths() -> Path:
+    """Файл дополнительных путей к моделям от Comfy Desktop.
+
+    Имя файла содержит номер установки и у каждого свой, поэтому он ищется, а не
+    задаётся: брать чужой номер нельзя. Если файлов несколько, берётся самый
+    свежий. Пустой результат означает, что Comfy Desktop не установлен.
+
+    @returns: путь к найденному файлу; путь с пустым именем, если ничего нет.
+    """
+    folder = Path(os.environ.get("APPDATA", "")) / "Comfy Desktop" / "instance-model-paths"
+    try:
+        found = sorted(folder.glob("inst-*.yaml"), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        found = []
+    return found[-1] if found else folder / "instance-model-paths.yaml"
+
+
+DEFAULT_COMFY_MODEL_PATHS = Path(
+    os.environ.get("NOVELFORGE_COMFY_PATHS", str(_comfy_model_paths()))
+)
 
 #: Настройки пользователя. Заполняет ``novel.settings`` при запуске: так пути
 #: из интерфейса попадают сюда, не заставляя модули импортировать друг друга.

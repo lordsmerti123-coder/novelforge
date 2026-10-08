@@ -1,14 +1,15 @@
 """Конечный автомат, связывающий текстовую модель и генератор изображений.
 
-Автомат существует из-за измеренной цифры: на 12 GB VRAM FreeToken и ComfyUI не
-помещаются одновременно. С работающим движком свободно максимум ~2.9 GB, а
-Qwen-Image-2.1 нужно около 8 GB. Поэтому ход с картинкой выглядит так:
+Автомат существует потому, что на карте 12 ГБ FreeToken и ComfyUI не
+помещаются одновременно: с работающим движком свободно около 3 ГБ, а
+Qwen-Image-2.1 нужно около 8 ГБ. Поэтому ход с картинкой выглядит так:
 
     IDLE -> LLM_ACTIVE -> SWITCH_TO_IMAGE -> IMAGE_GEN -> SWITCH_TO_LLM -> IDLE
 
-``SWITCH_TO_IMAGE`` останавливает движок целиком (это освобождает ~9.8 GB за
-0.75 с), ``SWITCH_TO_LLM`` поднимает его заново (~44 с до первого токена).
-Картинки поэтому копятся в очередь и рисуются пачкой за одно переключение.
+``SWITCH_TO_IMAGE`` останавливает движок целиком и освобождает почти всю
+видеопамять, ``SWITCH_TO_LLM`` поднимает его заново — до первого токена
+проходят десятки секунд. Картинки поэтому копятся в очередь и рисуются пачкой
+за одно переключение.
 
 Сервер ComfyUI живёт постоянно — его поднимает пользователь один раз. Автомат
 управляет только выгрузкой моделей из VRAM через ``POST /free``.
@@ -27,7 +28,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from novel import config, metrics, prompts
+from novel import config, metrics, prompts, quest
 from novel.comfy import ComfyClient, ComfyError, build_t2i_graph, stage_reference
 from novel.context import AssembledPrompt, ContextBuilder
 from novel.db import Character, NovelDB
@@ -37,12 +38,19 @@ from novel.external import (
     ExternalController,
     find_server,
     is_external_url_alive,
+    list_server_model_info,
+    lmstudio_load,
+    lmstudio_loaded,
+    lmstudio_unload,
     list_server_models,
 )
-from novel.formats import get_format
+from novel.formats import effective_images, get_format, resolve_format
 from novel.freetoken import FreeTokenClient, FreeTokenError
-from novel.models import ModelRegistry
-from novel.protocol import ParsedReply, SceneSpec, loads_json, looks_from_text, parse_reply
+from novel.models import ModelRegistry, pick_best_model
+from novel import ftdaemon
+from novel.procutil import stop_engine_processes
+from novel.protocol import (ParsedReply, SceneSpec, loads_json, looks_from_text,
+                            parse_reply, strip_machine_tags)
 from novel.settings import SettingsStore
 from novel.vision import prepare_image, save_upload, user_message
 
@@ -152,7 +160,14 @@ class NovelMachine:
         self.last_agent_run: dict[str, Any] | None = None
         self.debug: dict[str, Any] = {}
         self._busy = threading.Lock()
+        #: Движок поднят службой FreeToken — её же и останавливать.
+        self._engine_via_daemon = False
         self._reasoning_ready = False
+        #: Размышляет ли модель на самом деле. Не то же самое, что настройка:
+        #: у части моделей положения «выключено» нет вовсе.
+        self._reasoning_active = False
+        #: Найденная сборка llama.cpp; ``None``, если ни одна не запускается.
+        self._external_server: Path | None = None
         #: Просьба остановить агента: выставляется, когда движок выгружают.
         self._agent_cancel = threading.Event()
         #: Момент перехода в текущую фазу — для показа «сколько уже длится».
@@ -210,6 +225,24 @@ class NovelMachine:
         busy = phase not in ("IDLE", "ERROR")
 
         detail = title
+        if phase == "IDLE":
+            # «Свободен» — правда только когда память и вправду свободна.
+            # Сведения берутся напрямую, а не из общего снимка: снимок сам зовёт
+            # эту подпись, и обращение к нему даёт бесконечную рекурсию.
+            try:
+                free_mb = int(metrics.gpu_stats().get("free_mb") or 0)
+                total_mb = int(metrics.gpu_stats().get("total_mb") or 0)
+            except (RuntimeError, OSError):
+                free_mb = total_mb = 0
+            held = max(0, total_mb - free_mb) if total_mb else 0
+            engine_up = self.controller.port_pid() is not None
+            if engine_up or held > 1500:
+                detail = (f"игра отложена, память занята: {held} МБ"
+                          if held else "игра отложена, движок поднят")
+            elif self.comfy.is_alive():
+                detail = "поднят генератор кадров, движка нет"
+            else:
+                detail = "свободен"
         if phase == "IMAGE_GEN" and self._current_scene:
             detail = f"рисуется кадр #{self._current_scene.get('id')}"
             if self._current_scene.get("reference"):
@@ -257,12 +290,15 @@ class NovelMachine:
                 if self.uses_external():
                     # У llama.cpp нет ни /v1/stats, ни геометрии кэша: спрашивать
                     # их — гарантированная ошибка в каждой сводке состояния.
-                    # Модель показывается из настроек, а не первая из списка:
-                    # список сервера отсортирован и к выбору отношения не имеет.
+                    # Занятость берётся у самого сервера: он отвечает и без
+                    # загруженной модели, поэтому одной живости порта мало.
                     engine["external"] = True
-                    engine["model"] = Path(str(self.settings.model_path)).name
-                    engine["server_models"] = len(list_server_models(str(
-                        getattr(self.settings, "external_url", "")))) or None
+                    url = str(getattr(self.settings, "external_url", ""))
+                    loaded = list(lmstudio_loaded(url)) if url else []
+                    engine["loaded"] = loaded
+                    engine["model"] = loaded[0] if loaded else None
+                    engine["wanted"] = Path(str(self.settings.model_path)).name
+                    engine["server_models"] = len(list_server_models(url)) or None
                 else:
                     stats = self.ft.stats()
                     engine["vram_mb"] = round((stats.get("vram_bytes") or 0) / (1024 * 1024))
@@ -323,6 +359,30 @@ class NovelMachine:
         tail = url.rstrip("/").rsplit(":", 1)[-1]
         return int(tail) if tail.isdigit() else 1919
 
+    def retire_stale_engine(self) -> dict[str, Any]:
+        """Гасит движок, если он обслуживает не ту модель, что выбрана.
+
+        Нужен при смене модели: без этого движок работает со старой до первого
+        хода, и по виду не понять, какая модель отвечает.
+
+        @returns: отчёт: ``stopped`` — гасили ли, ``running`` — что было,
+            ``wanted`` — что выбрано.
+        """
+        running = str(self.status().get("engine", {}).get("model") or "")
+        wanted = str(self.settings.model_path or "")
+        report: dict[str, Any] = {"running": running, "wanted": wanted, "stopped": False}
+        if not running or not wanted:
+            return report
+        if running in wanted or wanted in running:
+            return report
+        self.note(f"выбрана другая модель — гашу движок, работавший с {running}")
+        try:
+            self.stop_engine()
+            report["stopped"] = True
+        except (RuntimeError, FreeTokenError) as exc:
+            report["error"] = str(exc)
+        return report
+
     def sync_engine(self) -> dict[str, Any]:
         """Пересобирает клиента и контроллер под выбранный движок.
 
@@ -338,14 +398,16 @@ class NovelMachine:
             self.ft = FreeTokenClient(url, timeout_s=float(settings.request_timeout_s))
             server = find_server(getattr(settings, "external_server_path", "") or None)
             manages = bool(getattr(settings, "external_manage", True))
-            if manages and server is not None:
+            if server is not None:
                 self.controller = ExternalController(server, port=port)
             else:
-                # Сервер поднимает кто-то другой — LM Studio. Запускать и
-                # останавливать его отсюда нельзя: мы бы убили чужой процесс.
+                # Сборки нет. Контроллер всё равно нужен: по нему считаются порт
+                # и состояние. Но запускать его нельзя — проверка перед стартом
+                # в ensure_engine вернёт понятную причину вместо ошибки Windows.
                 self.controller = ExternalController(
-                    server or Path("llama-server.exe"), port=port
+                    Path("llama-server.exe"), port=port
                 )
+            self._external_server = server
             if getattr(self, "context", None) is not None:
                 self.context.ft = self.ft
             return {
@@ -380,8 +442,8 @@ class NovelMachine:
         """Гарантирует, что сервер ComfyUI запущен.
 
         Сервер поднимается напрямую, без Comfy Desktop: приложение не стартует
-        backend само, а ждёт нажатия Start в окне. Прямой запуск занимает около
-        пятнадцати секунд против нескольких минут у оболочки.
+        backend само, а ждёт нажатия Start в окне. Прямой запуск заметно скорее
+        оболочки.
 
         @param timeout_s: сколько ждать готовности сервера.
         @returns: отчёт о запуске; ``ready`` показывает, удалось ли.
@@ -416,14 +478,33 @@ class NovelMachine:
         if self._reasoning_ready and not force:
             return {"skipped": True}
         if self.uses_external():
-            # llama.cpp не принимает настройку размышлений после запуска: её
-            # задают ключом шаблона при старте сервера.
-            self._reasoning_ready = True
             off = bool(getattr(self.settings, "external_disable_thinking", True))
-            return {"mode": "off" if off else "on", "applied": False, "external": True,
-                    "reason": "задаётся при запуске llama.cpp"}
+            self._reasoning_active = not off
+            manages = bool(getattr(self.settings, "external_manage", True))
+            if manages:
+                # Сервер поднимаем мы: размышления задаются при запуске
+                # llama.cpp, после старта их не переиграть.
+                self.ft.reasoning_kwargs = None
+                self._reasoning_ready = True
+                return {"mode": "off" if off else "on", "applied": False, "external": True,
+                        "reason": "задаётся при запуске llama.cpp"}
+            # Сервер чужой — LM Studio: ключи запуска ему не передать, поэтому
+            # просьба не размышлять уходит в самом запросе. Без неё модель тратит
+            # весь бюджет ответа на рассуждения и до текста не доходит.
+            self.ft.reasoning_kwargs = {"reasoning_effort": "none"} if off else None
+            self._reasoning_ready = True
+            return {
+                "mode": "off" if off else "on",
+                "applied": off,
+                "external": True,
+                "reason": "просьба не размышлять в запросе" if off else "режим on",
+            }
         report = self.ft.configure_reasoning(self.settings.reasoning_mode)
         self._reasoning_ready = True
+        # Модель размышляет, если режим вышел включённым или если выключить не
+        # удалось: у таких моделей положения «выключено» попросту нет.
+        asked_off = self.settings.reasoning_mode == "off"
+        self._reasoning_active = not (asked_off and report.get("applied"))
         if report.get("applied"):
             self.note(
                 f"размышления модели: {report['mode']} "
@@ -435,6 +516,91 @@ class NovelMachine:
                 f"движок не предложил аргументов ({report.get('reason') or report.get('error')})"
             )
         return report
+
+    def _output_budget(self) -> int:
+        """Предел вывода с запасом под размышления.
+
+        Считается по тому, размышляет ли модель на самом деле, а не по тому,
+        что стоит в настройке: у модели без положения «выключено» они
+        расходятся, и запас иначе не даётся.
+
+        @returns: предел вывода в токенах.
+        """
+        settings = self.settings
+        total = max(1, int(settings.max_tokens))
+        if self._reasoning_active:
+            reserve = max(0, int(getattr(settings, "reasoning_reserve_tokens", 3000)))
+            total += reserve
+        return total
+
+    def resolve_model(self, engine: str | None = None) -> dict[str, Any]:
+        """Решает, какую модель будет обслуживать движок, ничего не загружая.
+
+        Порядок: уже выбранная под этот движок, затем та, с которой работали в
+        прошлый раз, затем самая крупная из помещающихся в память. Память здесь
+        не занимается: модель поднимается отдельно — кнопкой или первым ходом.
+
+        @param engine: движок, для которого выбирается модель; по умолчанию текущий.
+        @returns: отчёт с ключами ``engine``, ``model``, ``source``, ``changed``.
+        """
+        settings = self.settings
+        target = engine or str(settings.engine_kind)
+        current = str(settings.model_path or "")
+
+        if target == "external":
+            url = str(getattr(settings, "external_url", "") or "")
+            info = list_server_model_info(url) if url else []
+            names = [item["name"] for item in info]
+            if current and (current in names or current.lower().endswith(".gguf")):
+                return {"engine": target, "model": current, "source": "выбрана", "changed": False}
+            remembered = settings.last_model_for("external")
+            if remembered and remembered in names:
+                settings.model_path = remembered
+                return {"engine": target, "model": remembered, "source": "прошлый раз", "changed": True}
+            budget = metrics.gpu_stats()["total_mb"] / 1024
+            best = pick_best_model(
+                [(item["name"], item["size_bytes"] / 1024 ** 3) for item in info], budget
+            )
+            if best:
+                settings.model_path = best
+                return {"engine": target, "model": best, "source": "подобрана", "changed": True}
+            return {"engine": target, "model": current, "source": "нет списка", "changed": False}
+
+        # FreeToken: каталоги HF и родной формат FTW.
+        local = [model for model in self.registry.all()
+                 if not model.supported or model.kind in ("hf", "ftw")]
+        by_path = {model.path: model for model in local if model.kind in ("hf", "ftw")}
+        if current in by_path:
+            return {"engine": target, "model": current, "source": "выбрана", "changed": False}
+        remembered = settings.last_model_for("freetoken")
+        if remembered and remembered in by_path:
+            settings.model_path = remembered
+            return {"engine": target, "model": remembered, "source": "прошлый раз", "changed": True}
+        budget = metrics.gpu_stats()["total_mb"] / 1024
+        best = pick_best_model([(model.path, model.size_gb) for model in by_path.values()], budget)
+        if best:
+            settings.model_path = best
+            return {"engine": target, "model": best, "source": "подобрана", "changed": True}
+        return {"engine": target, "model": current, "source": "нет списка", "changed": False}
+
+    def _prepare_engine(self) -> None:
+        """Готовит уже запущенный движок к запросу.
+
+        Одной живости сервера мало: LM Studio отвечает и без загруженной модели.
+        Ход тогда падает с «No models loaded», хотя порт занят и всё выглядит
+        рабочим. Поэтому перед запросом проверяется и модель, и размышления.
+
+        @raises RuntimeError: если модель поднять не удалось.
+        """
+        if self.uses_external() and not bool(
+            getattr(self.settings, "external_manage", True)
+        ):
+            problem = self._ensure_external_model()
+            if problem is not None:
+                raise RuntimeError(
+                    str(problem.get("error") or "движок внешнего сервера не готов")
+                )
+        self._configure_reasoning()
 
     def invalidate_reasoning(self) -> None:
         """Заставляет перечитать настройки размышлений при следующем запросе.
@@ -448,16 +614,39 @@ class NovelMachine:
         """Гарантирует, что движок запущен и отвечает.
 
         Перед стартом проверяется свободная VRAM: если её держит ComfyUI, он
-        сначала выгружается. Движку нужно около 9.6 GB, а ComfyUI после
-        генерации продолжает занимать почти всю карту, пока его не попросят.
+        сначала выгружается. Движку нужна почти вся карта, а ComfyUI после
+        генерации продолжает занимать её, пока его не попросят.
 
         @returns: отчёт о старте; ``ready`` показывает, удалось ли дождаться.
         """
         settings = self.settings
         if self.controller.is_healthy():
-            running = self.status().get("engine", {}).get("model")
-            wanted = str(settings.model_path)
-            if running and wanted and running not in wanted and wanted not in running:
+            # Чужой сервер отвечает и без загруженной модели: для него одной
+            # живости мало. Разбираемся с моделью, иначе ход упрётся в
+            # «No models loaded» — сервер жив, а говорить нечем.
+            if self.uses_external() and not bool(
+                getattr(settings, "external_manage", True)
+            ):
+                problem = self._ensure_external_model()
+                if problem is not None:
+                    return problem
+            engine_info = self.status().get("engine", {})
+            running = engine_info.get("model")
+            wanted = (engine_info.get("wanted") if self.uses_external()
+                      else str(settings.model_path))
+            if self.uses_external():
+                # Сервер отвечает и без модели: пустой список загруженного
+                # означает, что говорить нечем, и модель надо поднять.
+                if not running:
+                    problem = self._ensure_external_model()
+                    if problem is not None:
+                        return problem
+                matches = bool(running) and bool(wanted) and (
+                    str(running).casefold() == str(wanted).casefold())
+            else:
+                matches = bool(running) and bool(wanted) and (
+                    running in wanted or wanted in running)
+            if running and wanted and not matches:
                 self.note(f"движок обслуживает {running}, а выбрана {wanted} — перезапускаю")
                 self.stop_engine()
             else:
@@ -480,6 +669,26 @@ class NovelMachine:
                 # порт освободится сам, и только потом стартуем.
                 self.controller.wait_port_free(timeout_s=30.0)
 
+        # Движок может быть не установлен вовсе — новый пользователь, чистый
+        # клон. Проверка идёт до запуска процесса: иначе Windows отвечает
+        # «не удаётся найти указанный файл», и причина в ошибке не видна.
+        if self.uses_external():
+            if find_server(getattr(settings, "external_server_path", "") or None) is None:
+                self.note("сборка llama.cpp не найдена")
+                return {
+                    "ready": False,
+                    "seconds": 0.0,
+                    "error": ("сборка llama.cpp не найдена. Поставьте LM Studio "
+                              "(сборка идёт в комплекте) или положите "
+                              "llama-server.exe рядом с проектом, либо укажите "
+                              "путь к нему в настройках."),
+                }
+        else:
+            problem = config.freetoken_problem()
+            if problem:
+                self.note(f"движок не поднят: {problem}")
+                return {"ready": False, "error": problem, "seconds": 0.0}
+
         if self.uses_external() and not bool(getattr(settings, "external_manage", True)):
             # Сервер LM Studio поднимает пользователь. Сказать об этом прямо
             # полезнее, чем молча ждать три минуты и выдать «не поднялся».
@@ -491,13 +700,18 @@ class NovelMachine:
                 "seconds": 0.0,
             }
 
+        # Перед стартом FreeToken освобождаем карту от того, что её держит:
+        # сначала чужая модель из LM Studio, потом модели ComfyUI.
+        self._free_external_vram()
         self._release_comfy_if_needed()
         started = time.time()
-        config = self.external_config() if self.uses_external() else self.engine_config()
-        report = self.controller.cold_start(
-            config,
-            timeout_s=timeout_s or settings.engine_start_timeout_s,
-        )
+        engine_cfg = self.external_config() if self.uses_external() else self.engine_config()
+        report = self._start_via_daemon(engine_cfg) if not self.uses_external() else None
+        if report is None:
+            report = self.controller.cold_start(
+                engine_cfg,
+                timeout_s=timeout_s or settings.engine_start_timeout_s,
+            )
         report["seconds"] = round(time.time() - started, 2)
         if report.get("ready"):
             timeline = report.get("timeline") or {}
@@ -508,6 +722,145 @@ class NovelMachine:
             errors = (report.get("timeline") or {}).get("errors") or []
             self.note(f"движок не поднялся: {errors[-1][:200] if errors else 'причина неизвестна'}")
         return report
+
+    def _start_via_daemon(self, engine_cfg: Any) -> dict[str, Any] | None:
+        """Поднимает движок FreeToken под службой-надзирателем.
+
+        Служба владеет деревом процессов движка, поэтому её остановка не
+        оставляет сирот. Готовность ждётся по двум признакам сразу: порт
+        отвечает и веса заняли своё место в памяти. Ответа порта мало — он
+        открывается задолго до загрузки, и запрос в этот промежуток падает.
+
+        @param engine_cfg: настройки запуска движка.
+        @returns: отчёт о запуске либо None, если служба недоступна.
+        """
+        try:
+            ftdaemon.spawn()
+            if not ftdaemon.is_up():
+                self.note("служба FreeToken не отвечает — запускаю движок напрямую")
+                return None
+            args = ftdaemon.serve_args(
+                float(getattr(self.settings, "engine_memory_ratio", 0.9)),
+                str(getattr(self.settings, "engine_moe_strategy", "offload")),
+                engine_cfg.host,
+                list(getattr(engine_cfg, "extra_args", []) or []),
+            )
+            started = time.time()
+            answer = ftdaemon.start(engine_cfg.model_path, port=engine_cfg.port,
+                                    serve_args=args)
+            self.note(f"служба FreeToken запускает движок: {answer}")
+            wait_s = ftdaemon.wait_ready(
+                engine_cfg.port,
+                timeout_s=float(getattr(self.settings, "engine_start_timeout_s", 900.0)),
+            )
+            if wait_s < 0:
+                return {"ready": False, "seconds": round(time.time() - started, 2),
+                        "error": "движок под службой не ответил"}
+            self._engine_via_daemon = True
+            return {"ready": True, "seconds": round(time.time() - started, 2),
+                    "pid": answer.get("pid"), "timeline": {"spawn_to_ready_s": round(wait_s, 1)}}
+        except ftdaemon.DaemonError as exc:
+            self.note(f"служба FreeToken отказала: {exc} — запускаю движок напрямую")
+            return None
+
+    def _stop_via_daemon(self, result: dict[str, Any]) -> bool:
+        """Останавливает движок через службу, если она им владеет.
+
+        Владение проверяется по факту, а не по памяти процесса: приложение могли
+        перезапустить, а движок под службой остался работать. Тогда старый путь
+        убил бы процессы, служба осталась бы без движка, а память вернулась бы
+        не полностью. Служба узнаётся по тому, что отвечает и держит движок.
+
+        @param result: отчёт, который дополняется сведениями об остановке.
+        @returns: признак того, что движок остановлен службой.
+        """
+        try:
+            if not ftdaemon.is_up() or not ftdaemon.engine_running():
+                self._engine_via_daemon = False
+                return False
+            started = time.time()
+            ftdaemon.stop()
+            self._engine_via_daemon = False
+            result["freetoken_stopped"] = 1
+            self.note(
+                f"движок остановлен службой за {round(time.time() - started, 1)} c, "
+                f"свободно VRAM {metrics.gpu_stats()['free_mb']} MB"
+            )
+            return True
+        except ftdaemon.DaemonError as exc:
+            self.note(f"служба не остановила движок: {exc} — гашу процессы")
+            return False
+
+    def _ensure_external_model(self) -> dict[str, Any] | None:
+        """Следит, чтобы в чужом сервере была загружена нужная модель.
+
+        Сервер живёт сам по себе и модель в нём то появляется, то исчезает:
+        пользователь мог выгрузить её руками, а мог — мы сами, освобождая
+        память под кадры. Отвечать «движок готов» при пустом сервере нельзя.
+
+        @returns: отчёт об ошибке, если модель поднять не удалось; иначе ``None``.
+        """
+        settings = self.settings
+        url = str(getattr(settings, "external_url", "") or "")
+        if not url:
+            return None
+        loaded = lmstudio_loaded(url)
+        # Если что-то уже загружено, ничего не трогаем: у пользователя могла быть
+        # открыта своя модель, и подменять её без спроса нельзя.
+        if loaded:
+            return None
+        wanted = str(getattr(settings, "model_path", "") or "")
+        if not wanted:
+            return {
+                "ready": False,
+                "error": "в LM Studio не загружена модель — выбери её в списке",
+                "seconds": 0.0,
+            }
+        # Модель могла быть выбрана файлом: серверу нужно имя, а не путь.
+        name = wanted.replace("\\", "/").rstrip("/").split("/")[-1]
+        if name.lower().endswith(".gguf"):
+            name = name[: -len(".gguf")]
+        if lmstudio_load(url, name):
+            self.note(f"модель загружена в LM Studio: {name}")
+            return None
+        return {
+            "ready": False,
+            "error": f"модель {name} не загрузилась в LM Studio — "
+                     f"проверь её имя и память",
+            "seconds": 0.0,
+        }
+
+    def _free_external_vram(self, needed_mb: int = 8500) -> None:
+        """Освобождает видеопамять, занятую моделью чужого сервера.
+
+        Нужна перед запуском FreeToken: LM Studio держит свою модель, пока её не
+        попросят, и вдвоём на одной карте они не помещаются. Процесс сервера не
+        трогаем — выгружаем только модель.
+
+        @param needed_mb: сколько памяти нужно освободить.
+        """
+        if self.uses_external():
+            # Свой внешний движок останавливает сам контроллер.
+            return
+        url = str(getattr(self.settings, "external_url", "") or "")
+        if not url or not is_external_url_alive(url):
+            return
+        loaded = lmstudio_loaded(url)
+        if not loaded:
+            return
+        try:
+            free_mb = metrics.gpu_stats()["free_mb"]
+        except (RuntimeError, OSError):
+            free_mb = 0
+        if free_mb >= needed_mb:
+            return
+        freed = [name for name in loaded if lmstudio_unload(url, name)]
+        if freed:
+            settled, last = metrics.wait_for_free_vram(threshold_mb=needed_mb, timeout_s=30.0)
+            self.note(
+                f"модель выгружена из LM Studio, свободно VRAM {last} MB"
+                + ("" if settled else " — мало")
+            )
 
     def _release_comfy_if_needed(self, needed_mb: int = 8500) -> None:
         """Выгружает модели ComfyUI, если они мешают движку занять VRAM."""
@@ -530,28 +883,64 @@ class NovelMachine:
     def stop_engine(self) -> dict[str, Any]:
         """Останавливает движок, освобождая VRAM под генерацию.
 
-        Чужой сервер не трогаем: если модель держит LM Studio, убивать его
-        процесс нельзя — пользователь поднимал его сам, и там могут быть свои
-        дела. В этом случае сообщаем, что освободить память нужно вручную.
+        Гасится всё, что эту память держит, — иначе освобождать нечего:
+
+        * процесс FreeToken — отдельный от контроллера llama.cpp, и после смены
+          движка контроллер указывает уже на новый, а прежний процесс остаётся;
+        * сервер llama.cpp, если им управляем мы;
+        * модель в чужом LM Studio — сам процесс сервера не трогаем: его
+          пользователь поднимал сам, и там могут быть свои дела.
+
+        @returns: отчёт о том, что и за сколько остановлено.
         """
-        if self.uses_external() and not bool(getattr(self.settings, "external_manage", True)):
-            # Проверка идёт первой: чужой сервер не останавливаем ни при каких
-            # условиях, даже если порт почему-то свободен.
+        result: dict[str, Any] = {}
+
+        if not self.uses_external() and self._stop_via_daemon(result):
+            self._reasoning_ready = False
+            return result
+
+        leftovers = stop_engine_processes()
+        if leftovers["stopped"]:
+            result["freetoken_stopped"] = leftovers["stopped"]
             self.note(
-                "внешний сервер не наш — выгрузи модель в LM Studio перед генерацией кадров"
+                f"движок FreeToken остановлен за {leftovers['seconds']} c, "
+                f"свободно VRAM {metrics.gpu_stats()['free_mb']} MB"
             )
-            return {"external_untouched": True, "manage": False}
-        if self.controller.port_pid() is None:
-            return {"already_stopped": True}
-        self._set_state(State.SWITCH_TO_IMAGE)
-        self._agent_cancel.set()
-        report = self.controller.stop(timeout_s=30.0)
+
+        manages = bool(getattr(self.settings, "external_manage", True))
+        if self.uses_external() and not manages:
+            url = str(getattr(self.settings, "external_url", "") or "")
+            loaded = lmstudio_loaded(url) if url else []
+            if loaded:
+                freed = [name for name in loaded if lmstudio_unload(url, name)]
+                if freed:
+                    result["unloaded"] = freed
+                    self.note(
+                        f"модель выгружена из LM Studio ({len(freed)}), "
+                        f"свободно VRAM {metrics.gpu_stats()['free_mb']} MB"
+                    )
+                else:
+                    self.note("выгрузить модель из LM Studio не удалось")
+            else:
+                result["unloaded"] = []
+            result["external_untouched"] = True
+            self._reasoning_ready = False
+            return result
+
+        if self.controller.port_pid() is not None:
+            self._set_state(State.SWITCH_TO_IMAGE)
+            self._agent_cancel.set()
+            report = self.controller.stop(timeout_s=30.0)
+            self._reasoning_ready = False
+            self.note(
+                f"движок остановлен за {report['stop_seconds']} c, "
+                f"свободно VRAM {report['gpu_free_after_mb']} MB"
+            )
+            return report
         self._reasoning_ready = False
-        self.note(
-            f"движок остановлен за {report['stop_seconds']} c, "
-            f"свободно VRAM {report['gpu_free_after_mb']} MB"
-        )
-        return report
+        if not result:
+            result["already_stopped"] = True
+        return result
 
     # --- миры и проверки ----------------------------------------------------
 
@@ -650,7 +1039,7 @@ class NovelMachine:
         if world is None:
             return {"issues": [{"level": "error", "text": "партия не привязана к миру"}]}
 
-        fmt = get_format(world.format)
+        fmt = resolve_format(session.format if session else "", world.format)
         if not world.brief.strip():
             issues.append({
                 "level": "warn",
@@ -751,7 +1140,7 @@ class NovelMachine:
             issues.append({
                 "level": "warn",
                 "text": "ComfyUI не отвечает на 8188",
-                "fix": "нажми «Поднять ComfyUI» — сервер поднимется сам за 15 секунд",
+                "fix": "нажми «Поднять ComfyUI» — сервер поднимется сам",
             })
 
         for problem in self.db.check_integrity():
@@ -1010,7 +1399,7 @@ class NovelMachine:
             if not report.get("ready"):
                 raise RuntimeError("движок FreeToken не удалось запустить")
         else:
-            self._configure_reasoning()
+            self._prepare_engine()
 
         settings = self.settings
         # Вложение всегда сохраняется в историю: игрок должен видеть своё фото,
@@ -1036,7 +1425,10 @@ class NovelMachine:
         )
 
         request: dict[str, Any] = {
-            "max_tokens": settings.max_tokens,
+            # Предел считается по тому, размышляет ли модель на самом деле:
+            # у модели без положения «выключено» размышления идут по тому же
+            # счёту, что и ответ, и без запаса ответа не будет вовсе.
+            "max_tokens": self._output_budget(),
             "temperature": settings.temperature,
             "timeout_s": settings.request_timeout_s,
         }
@@ -1062,21 +1454,33 @@ class NovelMachine:
         for error in parsed.errors:
             self.note(f"разбор ответа: {error}")
 
+        # Последняя проверка перед записью: машинный блок, который разбор не
+        # отделил, не должен попасть в историю партии — иначе туда ляжет сырой
+        # ответ целиком.
+        content, leftover = strip_machine_tags(parsed.prose)
+        if leftover:
+            self.note(
+                "в тексте для игрока остались машинные блоки "
+                f"({', '.join(leftover)}) — вырезаны перед записью"
+            )
+
         message_id = self.db.add_message(
-            session_id, "assistant", parsed.prose, tokens=result.completion_tokens
+            session_id, "assistant", content, tokens=result.completion_tokens
         )
-        outcome = TurnOutcome(prose=parsed.prose, parsed=parsed, timings=timings,
+        outcome = TurnOutcome(prose=content, parsed=parsed, timings=timings,
                               assistant_message_id=message_id)
         outcome.summary = self._maybe_summarize(session_id, prompt)
 
         if parsed.looks:
-            # Ведущий сообщил, как персонажи выглядят теперь. Храним в состоянии
-            # партии: сводка истории такие подробности теряет.
+            # Ведущий сообщил, как изменилась внешность персонажей. Храним в
+            # состоянии партии: сводка истории такие подробности теряет.
             self._merge_looks(session_id, parsed.looks)
 
-        # Ведущий о блоке looks не помнит и почти никогда его не присылает —
-        # проверено на живой машине. Поэтому после хода задаём прямой короткий
-        # вопрос отдельным запросом.
+        if parsed.quest:
+            self._apply_quest_report(session_id, parsed.quest)
+
+        # Ведущий о блоке looks не помнит и почти никогда его не присылает.
+        # Поэтому после хода задаём прямой короткий вопрос отдельным запросом.
         tracked = self._track_looks(session_id, user_input, parsed.prose, settings, timings)
         if tracked:
             self._merge_looks(session_id, tracked)
@@ -1099,14 +1503,30 @@ class NovelMachine:
             if closed:
                 self.note(f"задумано на потом: {label} {closed}")
 
+        if parsed.scene is None and self._scene_expected(session_id):
+            # Кадр был нужен, а ведущий его не описал. Собираем отдельным
+            # коротким вызовом: он не ведёт игру, а только переводит случившееся
+            # в английское описание для генератора. Русский текст генератору не
+            # годится, а другого источника у кадра нет.
+            _, frame = effective_images(
+                self.db.world(self.db.session(session_id).world_id), self.settings
+            )
+            composed = self._compose_scene(session_id, parsed.prose, frame)
+            if composed is not None:
+                parsed.scene = composed
+
         if parsed.scene is not None:
             location = parsed.scene.location or self.db.get_state(session_id, "location", "")
             if location:
                 self.db.set_state(session_id, "location", location)
+                # В квесте место двигает состояние сюжета: блок <quest> ведущий
+                # ставит через раз, а место называет всегда. Переход принимается
+                # только возможный, поэтому выдуманное место ничего не сдвинет.
+                self._sync_quest_location(session_id, location)
             if parsed.scene.npc:
-                # Выдуманные имена внутрь не пускаем: на практике ведущий
-                # назвал «Марлу», которой в мире нет, и она осела в состоянии
-                # партии — кадр потом показывал не того. Тот же урок, что с
+                # Выдуманные имена внутрь не пускаем: ведущий может назвать
+                # персонажа, которого в мире нет, и он осядет в состоянии
+                # партии — кадр потом покажет не того. Тот же случай, что с
                 # «внешностью сейчас».
                 known, invented = self._known_npcs(session_id, parsed.scene.npc)
                 if invented:
@@ -1145,9 +1565,8 @@ class NovelMachine:
                 location_id=location_id,
             )
             # Генератор понимает только английский. Ведущий иногда пишет описание
-            # кадра по-русски — без проверки кадр выходит мусорным, — и кадр получается
-            # мусорным. Молчать об этом нельзя: иначе непонятно, почему картинка
-            # не та.
+            # кадра по-русски — без проверки кадр выходит мусорным. Молчать об
+            # этом нельзя: иначе непонятно, почему картинка не та.
             if not _looks_english(final_prompt):
                 self.note(
                     f"сцена #{scene_id}: описание кадра не по-английски — "
@@ -1324,8 +1743,8 @@ class NovelMachine:
     def _match_character(self, world_id: int, name: str) -> Character | None:
         """Находит персонажа мира по имени, как его назвала модель.
 
-        Точного совпадения мало. Ведущий пишет «Селена» там, где в карточке
-        «Селена, верховная жрица», и пишет «Марлу» там, где такого персонажа нет
+        Точного совпадения мало: ведущий называет персонажа коротко там, где в
+        карточке он записан с титулом, и придумывает имена, которых в мире нет
         вовсе. Поэтому сравнение идёт по трём ступеням, а выдумка не проходит.
 
         @param world_id: мир.
@@ -1342,7 +1761,7 @@ class NovelMachine:
         by_full = {c.name.strip().casefold(): c for c in characters}
         if wanted in by_full:
             return by_full[wanted]
-        # «Селена» должна найти «Селена, верховная жрица».
+        # Короткое имя должно найти карточку с титулом.
         by_head = {
             c.name.split(",")[0].strip().casefold(): c
             for c in characters
@@ -1384,7 +1803,10 @@ class NovelMachine:
         """
         session = self.db.session(session_id)
         world = self.db.world(session.world_id) if session is not None else None
-        return get_format(world.format if world is not None else "story")
+        return resolve_format(
+            session.format if session is not None else "",
+            world.format if world is not None else "",
+        )
 
     def _world_style(self, session_id: int) -> str:
         """Стиль изображений мира этой партии.
@@ -1400,9 +1822,9 @@ class NovelMachine:
         """Кто должен быть в кадре, когда формат рисует портрет собеседника.
 
         Ведущий заполняет ``npc`` через раз, а без него кадр уходит во что
-        угодно: на пробе выходило «POV shot from a pilot seat» вместо человека,
-        который только что ответил. Поэтому subject определяется и по репликам:
-        последний говорящий в ответе — тот, чью реакцию и надо показать.
+        угодно — вместо человека, который только что ответил, в него попадает
+        случайный план. Поэтому subject определяется и по репликам: последний
+        говорящий в ответе — тот, чью реакцию и надо показать.
 
         @param session_id: партия.
         @param scene: разобранный блок сцены.
@@ -1427,31 +1849,114 @@ class NovelMachine:
         return None
 
     def _shape_portrait(self, prompt: str, character: Character, style: str) -> str:
-        """Приводит промпт кадра к портрету в полный рост.
+        """Собирает промпт кадра: описание ведущего и внешность собеседника.
 
-        Если ведущий уже описал полный рост, промпт не трогается: там могут быть
-        поза и обстановка, которых в карточке персонажа нет. Иначе промпт
-        собирается заново из внешности — иначе кадр покажет не того.
+        Описание ведущего сохраняется целиком — в нём поза, ракурс и то, что
+        происходит сейчас. Сборка кадра из одной карточки персонажа дала бы
+        «full body shot of <внешность>» на любой ход: правка описания и
+        перерисовка ничего бы не меняли — строка была бы одна и та же.
 
-        @param prompt: промпт от ведущего.
+        Внешность дописывается к описанию, чтобы собеседник выглядел одинаково
+        от кадра к кадру. Если ведущий её уже назвал, второй раз не повторяется.
+
+        @param prompt: описание кадра от ведущего.
         @param character: тот, кого надо показать.
         @param style: стиль мира.
         @returns: промпт кадра.
         """
-        if "full body" in (prompt or "").lower():
-            return prompt
+        described = (prompt or "").strip()
         look = (character.appearance or character.description or "").strip()
         # Внешность по-русски генератору не годится: подстановка дала бы
-        # «full body shot of цифровой образ». Тогда остаётся описание ведущего —
-        # оно уже на английском, и его достаточно пометить полным ростом.
+        # «full body shot of цифровой образ».
         if look and not _looks_english(look):
             look = ""
-        if look:
-            tail = f", {style.strip()}" if _looks_english(style) else ""
-            return f"full body shot of {look}{tail}"
-        if prompt.strip():
-            return f"full body shot, {prompt.strip()}"
-        return prompt
+
+        parts: list[str] = []
+        if described:
+            parts.append(described)
+            # Карточку ведущему велено брать дословно, поэтому внешность в
+            # описании обычно уже есть. Тогда второй раз она не нужна: повтор
+            # только раздувает промпт.
+            head = " ".join(look.lower().split()[:4]) if look else ""
+            if look and head and head not in described.lower():
+                parts.append(look)
+        elif look:
+            parts.append(look)
+        # Стиль идёт только к чему-то: промпт из одного стиля ничего не нарисует,
+        # и звать с ним генератор незачем.
+        if parts and _looks_english(style):
+            parts.append(style.strip())
+        return ", ".join(part for part in parts if part)
+
+    def _scene_expected(self, session_id: int) -> bool:
+        """Ждём ли кадр в этот ход.
+
+        Тип повествования должен его допускать, а политика — не запрещать.
+        При «никогда» и «только по кнопке» кадра не ждут.
+
+        @param session_id: партия.
+        @returns: True, если кадр ожидается.
+        """
+        fmt = self._format_for(session_id)
+        if not fmt.wants_scene:
+            return False
+        session = self.db.session(session_id)
+        world = self.db.world(session.world_id) if session is not None else None
+        policy, _ = effective_images(world, self.settings)
+        return policy not in ("never", "manual")
+
+    def _compose_scene(
+        self, session_id: int, prose: str, frame: str
+    ) -> SceneSpec | None:
+        """Собирает описание кадра отдельным вызовом модели.
+
+        Нужен, когда ведущий кадр не описал: тогда рисовать нечего, а политика
+        кадр ждёт. Отдельный вызов не ведёт игру — он только переводит
+        случившееся в английское описание для генератора. Русский текст ему не
+        годится, поэтому пересказ делает модель.
+
+        @param session_id: партия.
+        @param prose: текст хода, который написал ведущий.
+        @param frame: рамка из настроек: ``portrait`` или ``scene``.
+        @returns: описание кадра либо ``None``, если собрать не удалось.
+        """
+        session = self.db.session(session_id)
+        world = self.db.world(session.world_id) if session is not None else None
+        if world is None or not prose.strip():
+            return None
+        characters = self.db.characters(world.id, enabled_only=True)
+        appearances = "\n".join(
+            f"- {character.name}: {character.appearance}"
+            for character in characters
+            if character.appearance
+        ) or "- неизвестна"
+        place = str(self.db.get_state(session_id, "location", "") or "")
+        body = prompts.render(
+            prompts.SCENE_COMPOSE_PROMPT,
+            style=world.style or "oil painting, fantasy",
+            appearances=appearances,
+            place=place or "не названо",
+            frame=("кадр снят с глаз игрока: то, что игрок видит перед собой"
+                   if frame == "portrait"
+                   else "общий план сцены: и собеседник, и обстановка"),
+            prose=prose.strip()[:1500],
+        )
+        try:
+            result = self.ft.chat(
+                [{"role": "user", "content": body}],
+                max_tokens=self.settings.image_prompt_max_tokens,
+                temperature=0.4,
+            )
+        except FreeTokenError as exc:
+            self.note(f"кадр не собран отдельным вызовом: {exc}")
+            return None
+        line = result.text.strip().strip('"').splitlines()
+        prompt = line[0].strip() if line else ""
+        if not prompt:
+            self.note("отдельный вызов не дал описания кадра")
+            return None
+        self.note(f"кадр собран отдельным вызовом ({result.completion_tokens} токенов)")
+        return SceneSpec(image_prompt=prompt, style=world.style or "", location=place)
 
     def _rewrite_image_prompt(self, session_id: int, scene: SceneSpec) -> str | None:
         """Просит модель превратить описание сцены в промпт для генератора."""
@@ -1495,7 +2000,10 @@ class NovelMachine:
         @param outcome: результат хода.
         @returns: ``True``, если запускать генерацию немедленно.
         """
-        policy = self.settings.image_policy
+        # Когда рисовать кадры, решает мир, а если у мира пусто — настройки.
+        session = self.db.session(session_id)
+        world = self.db.world(session.world_id) if session is not None else None
+        policy, _ = effective_images(world, self.settings)
         if policy in ("never", "manual", "idle"):
             return False
         if policy == "minimal":
@@ -1784,12 +2292,60 @@ class NovelMachine:
                 canonical[character.name.strip().casefold()] = character.name
         return canonical
 
+    def _sync_quest_location(self, session_id: int, name: str) -> None:
+        """Двигает состояние квеста по названному месту.
+
+        @param session_id: партия.
+        @param name: как место назвал ведущий.
+        """
+        key = str(self.db.get_state(session_id, quest.QUEST_KEY, "") or "")
+        definition = quest.get_quest(key) if key else None
+        if not definition:
+            return
+        state = quest.read_state(self.db, session_id, definition)
+        result = quest.sync_location(self.db, session_id, definition, state, name)
+        for line in (result["state"].get("log") or [])[-1:]:
+            if result["changed"]:
+                self.note(f"квест: {line}")
+
+    def _apply_quest_report(self, session_id: int, report: dict[str, Any]) -> None:
+        """Применяет отчёт квеста и рассказывает о нём в журнале.
+
+        Всё недопустимое отклоняется: ведущий не может выдать предмет, которого
+        нет на месте, или перескочить этап. Отклонённое попадёт в промпт
+        следующим ходом, и он поправится сам.
+
+        @param session_id: партия.
+        @param report: разобранный блок ``<quest>``.
+        """
+        key = str(self.db.get_state(session_id, quest.QUEST_KEY, "") or "")
+        definition = quest.get_quest(key) if key else None
+        if not definition:
+            # Блок пришёл в обычном мире: разбирать его нечем, и молчать нельзя —
+            # иначе непонятно, почему переходы не работают.
+            self.note("блок quest пришёл, но партия идёт не по квесту — пропускаю")
+            return
+        result = quest.apply_report(self.db, session_id, definition, report)
+        session = self.db.session(session_id)
+        if session is not None:
+            # Панель инвентаря читает таблицу вещей, а не состояние квеста:
+            # без сверки игрок не увидит, что у него в руках.
+            quest.sync_inventory(self.db, session.world_id, definition, result["state"])
+        for line in result["applied"]:
+            self.note(f"квест: {line}")
+        for line in result["rejected"]:
+            self.note(f"квест, не принято: {line}")
+        outcome = quest.outcome(result["state"])
+        if outcome == "win":
+            self.note("квест пройден до конца")
+        elif outcome == "lose":
+            self.note("квест проигран")
+
     def _merge_looks(self, session_id: int, fresh: dict[str, str]) -> None:
         """Дописывает изменения внешности в состояние партии.
 
-        Имена приводятся к каноническому написанию, а прежние записи
-        переписываются заново: так разбираются пары вроде «игрок» и «Игрок»,
-        накопившиеся до этой правки.
+        Имена приводятся к каноническому написанию, а все записи
+        переписываются заново: так разбираются пары вроде «игрок» и «Игрок».
 
         @param session_id: партия.
         @param fresh: новые описания «имя — как выглядит».
@@ -1863,10 +2419,10 @@ class NovelMachine:
         ]
         started = time.time()
         try:
-            # Размышления выключаем и здесь, а бюджета даём с запасом: с 220
-            # токенами модель уходила в размышления целиком и не отвечала вовсе
-            # (finish_reason='length') — проверка падала на каждом ходу.
-            self._configure_reasoning()
+            # Размышления выключаем и здесь, а бюджета даём с запасом: при
+            # малом пределе модель уходит в размышления целиком и не отвечает
+            # вовсе (finish_reason='length').
+            self._prepare_engine()
             result = self.ft.chat_stream(
                 messages, max_tokens=800, temperature=0.0,
                 timeout_s=settings.request_timeout_s,
@@ -1943,7 +2499,7 @@ class NovelMachine:
             history=history[:2500],
             notes=existing[:800],
         )
-        self._configure_reasoning()
+        self._prepare_engine()
         try:
             result = self.ft.chat(
                 [{"role": "user", "content": body}],

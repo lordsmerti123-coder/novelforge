@@ -363,6 +363,10 @@
         <input id="char-appearance" class="grow" placeholder="внешность по-английски — уходит генератору кадров">
             <button class="ghost" id="btn-char-voice" title="образцы сообщений: по одной строке на сообщение">переписка</button>
         <button class="ghost" id="btn-add-char">+</button></div>
+        <div id="char-voice-box" hidden>
+          <textarea id="char-voice" rows="3" placeholder="образцы сообщений персонажа, по одной строке: по ним ведущий подстраивает его речь"></textarea>
+          <div class="tok">Образцы уходят ведущему как пример речи. Пустое поле — персонаж говорит общими словами.</div>
+        </div>
       <h3 style="font-size:13px;margin:14px 0 6px">Вещи <span class="tok" id="items-count"></span></h3>
       <div id="items"></div>
       <div class="row-line"><input id="item-name" placeholder="название" style="max-width:150px">
@@ -394,8 +398,10 @@
 
       <h3 style="font-size:13px;margin:14px 0 8px">Модель</h3>
       <div class="row-line"><select id="model-select" class="grow"></select>
+        <button class="ghost" id="btn-refresh-models" title="перечитать каталоги с моделями">Обновить список</button>
         <button class="ghost" id="btn-apply-model">Выбрать (с пресетом)</button></div>
       <div id="model-note" class="p"></div>
+      <div id="models-hint" class="p"></div>
       <div class="field"><label>Каталоги с моделями</label>
         <input id="f-models_dirs" placeholder="например C:\models">
         <span class="hint">Где искать чекпоинты. Несколько каталогов — через
@@ -1841,6 +1847,7 @@ $("btn-kill").onclick = async () => {
 };
 $("btn-save-settings").onclick = saveSettings;
 $("btn-apply-model").onclick = applyModel;
+  $("btn-refresh-models").onclick = () => loadModels(true);
 if ($("f-engine_kind")) $("f-engine_kind").onchange = async () => {
   showEngineFields();
   // Смена движка применяется сразу: у FreeToken и llama.cpp разные наборы

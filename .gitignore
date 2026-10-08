@@ -1,0 +1,71 @@
+# Данные и журналы: генерируются при работе, в репозиторий не попадают.
+logs/
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/images/
+data/uploads/
+data/settings.json
+*.log
+
+# Резервные копии и приватные копии проекта.
+backups/
+private/
+
+# Рабочие заметки для агента: не часть публичного репозитория.
+AGENTS.md
+CLAUDE.md
+.agents/
+
+# Локальные прогоны на конкретной машине: содержат пути и имена сборок.
+local_run.py
+local_shots.py
+local_*.json
+local_api_check.py
+
+# Инструменты проверки: список терминов для поиска и отчёты о работе.
+scan_*.py
+audit_*.py
+verify_*.py
+rewrite_*.py
+*content_audit*.py
+*_audit.py
+ИНСТРУКЦИЯ-*.md
+ПРАВИЛА-*.md
+ОТЧЁТ-*.md
+
+# Данные и модели: в репозиторий не входят.
+*.gguf
+*.safetensors
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.oai
+sessions/
+output/
+release/
+dist/
+build/
+
+# Python.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Каталоги, которые проект создаёт рядом с собой для движков и моделей.
+models/
+ComfyUI/
+comfy-shared/
+
+# Редакторы и ОС.
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
